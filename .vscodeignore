@@ -1,0 +1,6 @@
+.git/**
+.github/**
+scripts/**
+images/icon.svg
+.gitignore
+.vscodeignore

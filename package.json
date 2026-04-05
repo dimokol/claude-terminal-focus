@@ -1,0 +1,38 @@
+{
+  "name": "claude-terminal-focus",
+  "displayName": "Claude Terminal Focus",
+  "description": "Focuses the correct VS Code terminal tab when clicking a Claude Code notification. Works with multiple VS Code windows and terminals on macOS and Windows.",
+  "version": "1.1.0",
+  "publisher": "dimokol",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dimokol/claude-terminal-focus"
+  },
+  "bugs": {
+    "url": "https://github.com/dimokol/claude-terminal-focus/issues"
+  },
+  "homepage": "https://github.com/dimokol/claude-terminal-focus#readme",
+  "icon": "images/icon.png",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "terminal",
+    "focus",
+    "notification",
+    "anthropic",
+    "ai",
+    "productivity"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {}
+}
