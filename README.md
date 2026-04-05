@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="images/icon.png" alt="Claude Terminal Focus" width="128" />
+</p>
+
 # Claude Terminal Focus
 
 **Focuses the correct VS Code terminal tab when clicking a Claude Code notification.**
