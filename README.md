@@ -4,154 +4,28 @@
 
 # Claude Terminal Focus
 
-**Focuses the correct VS Code terminal tab when clicking a Claude Code notification.**
+**All-in-one Claude Code notification system — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.**
 
-When running multiple Claude Code sessions across different VS Code windows and terminals, this extension + notification hooks let you:
+When running multiple Claude Code sessions across different VS Code windows and terminals:
 
 1. **Hear a sound** when Claude finishes a task or needs your input
-2. **See a banner notification** showing which project needs attention
+2. **See an OS notification** showing which project needs attention
 3. **Click the notification** to jump directly to the correct VS Code window and terminal tab
 
-Works with multiple VS Code windows and multiple Claude terminals simultaneously on **macOS** and **Windows**.
+Works on **macOS**, **Windows**, and **Linux** with multiple VS Code windows and terminals simultaneously.
 
-## Installation
+## Quick Start
 
-### 1. Install the VS Code Extension
+1. **Install** from the VS Code Marketplace:
+   - Extensions (Ctrl/Cmd+Shift+X) → Search **"Claude Terminal Focus"** → Install
 
-From the VS Code Marketplace:
-- Open VS Code → Extensions (Ctrl/Cmd+Shift+X) → Search **"Claude Terminal Focus"** → Install
+2. **Set up hooks** — on first activation, the extension will prompt you:
 
-Or via CLI:
-```bash
-code --install-extension dimokol.claude-terminal-focus
-```
+   > *"Set up Claude Code hooks for automatic notifications?"* → **Set Up Now**
 
-### 2. Set Up Notification Scripts
+   That's it. The extension installs everything automatically.
 
-The extension needs notification hooks configured in Claude Code to write signal files and show notifications.
-
----
-
-## macOS Setup
-
-### Prerequisites
-
-```bash
-brew install terminal-notifier
-```
-
-Then: **System Settings → Notifications → terminal-notifier** → set alert style to **Alerts** (stays on screen until dismissed).
-
-### Create notification scripts
-
-Copy the scripts from this repo to your Claude config directory:
-
-```bash
-cp scripts/macos/notify.sh ~/.claude/notify.sh
-cp scripts/macos/task-complete.sh ~/.claude/task-complete.sh
-chmod +x ~/.claude/notify.sh ~/.claude/task-complete.sh
-```
-
-**Important**: Check the path to `code` CLI in both scripts. The default is `/usr/local/bin/code`. Verify with `which code` — on Apple Silicon it might be `/opt/homebrew/bin/code`. Update the scripts if needed.
-
-### Configure Claude Code hooks
-
-Add to `~/.claude/settings.json` (merge with existing content):
-
-```json
-{
-  "hooks": {
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash $HOME/.claude/task-complete.sh"
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash $HOME/.claude/notify.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-### Global gitignore
-
-```bash
-echo '.vscode/.claude-focus' >> ~/.gitignore_global
-echo '.vscode/.claude-focus-clicked' >> ~/.gitignore_global
-git config --global core.excludesfile ~/.gitignore_global
-```
-
----
-
-## Windows Setup
-
-Windows uses PowerShell scripts with Windows Runtime Toast API for notifications.
-
-### Create scripts
-
-Copy the scripts from this repo to your Claude config directory:
-
-```powershell
-Copy-Item scripts/windows/write-signal.ps1 $env:USERPROFILE\.claude\write-signal.ps1
-Copy-Item scripts/windows/notify.ps1 $env:USERPROFILE\.claude\notify.ps1
-Copy-Item scripts/windows/task-complete.ps1 $env:USERPROFILE\.claude\task-complete.ps1
-```
-
-### Configure Claude Code hooks
-
-Add to `%USERPROFILE%\.claude\settings.json`. **Replace `YOUR_USERNAME`** with your Windows username in all 4 places:
-
-```json
-{
-  "hooks": {
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "mkdir -p \"$PWD/.vscode\" && cygpath -w \"$PWD\" > \"$HOME/.claude/notify-path\" && powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_USERNAME/.claude/write-signal.ps1 && powershell -NoProfile -Command \"\\$ws = New-Object -ComObject WScript.Shell; \\$ws.Run('powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Users\\YOUR_USERNAME\\.claude\\task-complete.ps1', 0, \\$false)\""
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "mkdir -p \"$PWD/.vscode\" && cygpath -w \"$PWD\" > \"$HOME/.claude/notify-path\" && powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_USERNAME/.claude/write-signal.ps1 && powershell -NoProfile -Command \"\\$ws = New-Object -ComObject WScript.Shell; \\$ws.Run('powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Users\\YOUR_USERNAME\\.claude\\notify.ps1', 0, \\$false)\""
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-### Global gitignore
-
-```bash
-echo '.vscode/.claude-focus' >> ~/.gitignore_global
-git config --global core.excludesfile ~/.gitignore_global
-```
-
----
+   Or run manually: `Ctrl/Cmd+Shift+P` → **"Claude Terminal Focus: Set Up Claude Code Hooks"**
 
 ## How It Works
 
@@ -159,57 +33,87 @@ git config --global core.excludesfile ~/.gitignore_global
 Claude needs input / finishes task
        │
        ▼
-Hook fires (bash script)
+Claude Code fires Stop or Notification hook
        │
-       ├── Writes .vscode/.claude-focus (ancestor PID chain)
-       ├── Plays sound
-       └── Shows notification banner with project name
+       ▼
+hook.js writes a JSON signal file (.vscode/.claude-focus)
+       │
+       ▼
+VS Code extension detects the signal
+       │
+       ├── Plays a sound (configurable)
+       └── Shows a notification
                 │
-                ▼ (user clicks notification)
-                │
-                ├── [macOS] terminal-notifier creates .claude-focus-clicked
-                │    + opens correct VS Code window via code CLI
-                │    └── Extension polls, finds marker → reads PIDs → focuses terminal
-                │
-                └── [Windows] Toast opens vscode://file/<path>
-                     └── Window focus event → extension reads PIDs → focuses terminal
+                ├── VS Code is unfocused → OS-level toast notification
+                └── VS Code is focused → in-window notification + OS fallback
+                         │
+                         ▼ (user clicks "Focus Terminal")
+                         │
+                         └── Extension finds the correct terminal tab via PID matching
 ```
 
-## Platform Differences
+## Recommended: Enable Native Notifications
 
-| | macOS | Windows |
-|---|---|---|
-| **Notifications** | `terminal-notifier` (brew) | Windows Runtime Toast API |
-| **Click detection** | `.claude-focus-clicked` marker file (polling) | `vscode://` URI triggers window focus event |
-| **Multi-window** | `code '$WORKSPACE_ROOT'` opens correct window | `vscode://file/<path>` opens correct window |
-| **PID chain** | `ps -o ppid=` | `Get-CimInstance Win32_Process` |
-| **Sound** | `afplay *.aiff` | `SystemSounds.Asterisk.Play()` |
+For the best experience, enable VS Code's native notifications so alerts reach you when VS Code is in the background:
 
-## Verify
+1. **VS Code**: Settings → search "native notifications" → enable **Window: Native Notifications**
+2. **macOS**: System Settings → Notifications → Visual Studio Code → Allow Notifications
+3. **Windows**: Settings → System → Notifications → Visual Studio Code → On
+4. **Linux**: Ensure `libnotify` is installed (most desktops include it)
 
-1. Reload VS Code (Cmd/Ctrl+Shift+P → "Developer: Reload Window")
-2. Open Output panel → select **"Claude Terminal Focus"** → should show "activated"
-3. Open 2+ terminals, run Claude in one, work in another
-4. When Claude needs input → sound + banner with project name
-5. Click the banner → correct VS Code window + correct terminal tab
+> The extension also uses `node-notifier` as a fallback when VS Code is focused, so notifications will work even when the VS Code window is in the foreground. The fallback respects your OS notification preferences — it never bypasses Do Not Disturb or mute settings.
+
+## Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `claudeTerminalFocus.sound.enabled` | `true` | Play a sound on notifications |
+| `claudeTerminalFocus.sound.volume` | `0.5` | Sound volume 0.0–1.0 (macOS/Linux) |
+| `claudeTerminalFocus.notification.useFallback` | `true` | Use OS-native fallback when VS Code window is focused (never overrides OS notification preferences) |
+| `claudeTerminalFocus.autoSetupHooks` | `true` | Prompt to install hooks on first run |
+
+## Commands
+
+Open the command palette (`Ctrl/Cmd+Shift+P`) and search for:
+
+| Command | Description |
+|---------|-------------|
+| **Claude Terminal Focus: Set Up Claude Code Hooks** | Install hooks in `~/.claude/settings.json` |
+| **Claude Terminal Focus: Remove Claude Code Hooks** | Remove hooks (keeps other settings intact) |
+| **Claude Terminal Focus: Add Signal Files to Global Gitignore** | Prevent signal files from showing in git |
+| **Claude Terminal Focus: Test Notification** | Send a test notification to verify your setup |
+
+## Upgrading from v1.x
+
+If you previously used the shell-script based setup:
+
+1. The extension will detect your legacy hooks and offer to upgrade automatically
+2. Choosing **"Replace"** removes the old shell hooks and installs the new Node.js hook
+3. Choosing **"Keep Both"** adds the new hook alongside the old ones (both will fire)
+4. You can safely delete the old scripts (`~/.claude/notify.sh`, `~/.claude/task-complete.sh`, etc.)
+5. `terminal-notifier` is no longer needed — you can uninstall it (`brew uninstall terminal-notifier`)
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| No sound | macOS: check `afplay`. Windows: check system volume |
-| No banner | macOS: System Settings → Notifications → terminal-notifier. Windows: Settings → Notifications |
-| Extension not activating | Output panel → "Claude Terminal Focus" dropdown. If missing, reinstall |
+| No notifications | Run **"Test Notification"** from the command palette |
+| No sound | Check Settings → `claudeTerminalFocus.sound.enabled` |
+| Notifications only appear inside VS Code | Enable native notifications (see above) |
+| Extension not activating | Output panel → "Claude Terminal Focus" dropdown |
 | Wrong terminal focused | Check Output panel PID matching logs |
-| macOS: wrong VS Code window | Check `which code` and update path in scripts |
-| macOS: notification disappears fast | Set terminal-notifier to "Alerts" in System Settings |
-| Windows: toast doesn't open VS Code | Run VS Code once to register the `vscode://` URL handler |
+| Hooks not firing | Run **"Set Up Claude Code Hooks"** command. Restart Claude Code after setup. |
 
-## Customizing Sounds
+## How the Hook Works
 
-**macOS**: Edit `notify.sh` / `task-complete.sh` and change the `afplay` path. Available sounds: `/System/Library/Sounds/*.aiff`
+The extension ships a `hook.js` file that Claude Code runs when it needs your attention. This script:
 
-**Windows**: Edit `notify.ps1` / `task-complete.ps1` and change `SystemSounds` call. Options: `Asterisk`, `Beep`, `Exclamation`, `Hand`, `Question`
+1. Reads the project directory from `CLAUDE_PROJECT_DIR` environment variable
+2. Finds the VS Code workspace root (walks up looking for `.vscode/`)
+3. Builds a PID ancestor chain (for terminal tab matching)
+4. Writes a JSON signal file to `.vscode/.claude-focus`
+
+The script is pure Node.js with no dependencies — it works identically on macOS, Windows, and Linux.
 
 ## License
 
