@@ -1,8 +1,8 @@
 {
   "name": "claude-terminal-focus",
   "displayName": "Claude Terminal Focus",
-  "description": "Focuses the correct VS Code terminal tab when clicking a Claude Code notification. Works with multiple VS Code windows and terminals on macOS and Windows.",
-  "version": "1.1.0",
+  "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero dependencies.",
+  "version": "2.0.0",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
@@ -28,11 +28,62 @@
     "notification",
     "anthropic",
     "ai",
-    "productivity"
+    "productivity",
+    "sound",
+    "alert"
   ],
   "activationEvents": [
     "onStartupFinished"
   ],
   "main": "./extension.js",
-  "contributes": {}
+  "dependencies": {
+    "node-notifier": "^10.0.1"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeTerminalFocus.setupHooks",
+        "title": "Claude Terminal Focus: Set Up Claude Code Hooks"
+      },
+      {
+        "command": "claudeTerminalFocus.removeHooks",
+        "title": "Claude Terminal Focus: Remove Claude Code Hooks"
+      },
+      {
+        "command": "claudeTerminalFocus.setupGitignore",
+        "title": "Claude Terminal Focus: Add Signal Files to Global Gitignore"
+      },
+      {
+        "command": "claudeTerminalFocus.testNotification",
+        "title": "Claude Terminal Focus: Test Notification"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Terminal Focus",
+      "properties": {
+        "claudeTerminalFocus.sound.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Play a sound when Claude needs attention"
+        },
+        "claudeTerminalFocus.sound.volume": {
+          "type": "number",
+          "default": 0.5,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Sound volume (0.0 to 1.0, macOS/Linux only)"
+        },
+        "claudeTerminalFocus.notification.useFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use OS-native notifications (via node-notifier) as fallback when VS Code window is focused. Respects OS notification preferences — never bypasses DND or mute."
+        },
+        "claudeTerminalFocus.autoSetupHooks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prompt to install Claude Code hooks on first activation"
+        }
+      }
+    }
+  }
 }
