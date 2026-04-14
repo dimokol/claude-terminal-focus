@@ -1,29 +1,50 @@
-// extension.js — Claude Notifications v2.0
+// extension.js — Claude Notifications v2.1
+// The hook.js handles sound + OS notifications (runs outside VS Code).
+// This extension handles: terminal focusing, status bar mute toggle, commands, first-run setup.
 const vscode = require('vscode');
 const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const { getSignalPath, getClickedPath, parseSignal } = require('./lib/signals');
-const { showNotification, isNativeNotificationsEnabled } = require('./lib/notifications');
-const { playSound } = require('./lib/sounds');
 const { checkHookStatus, installHooks, uninstallHooks } = require('./lib/hooks-installer');
 const { checkGitignoreStatus, setupGitignore } = require('./lib/gitignore-setup');
+const { playSound } = require('./lib/sounds');
 
 const POLL_MS = 800;
+const CONFIG_FILE = 'claude-notifications-config.json';
 
 function activate(context) {
   const log = vscode.window.createOutputChannel('Claude Notifications');
-  log.appendLine('Claude Notifications v2.0 activated');
+  log.appendLine('Claude Notifications v2.1 activated');
   log.appendLine(`Workspace folders: ${(vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath).join(', ') || 'none'}`);
 
-  // --- Register commands ---
+  // --- Status bar mute toggle ---
+  const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusBarItem.command = 'claudeNotifications.toggleMute';
+  updateStatusBar(statusBarItem);
+  statusBarItem.show();
+  context.subscriptions.push(statusBarItem);
 
+  // --- Register commands ---
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeNotifications.setupHooks', () => cmdSetupHooks(context, log)),
     vscode.commands.registerCommand('claudeNotifications.removeHooks', () => cmdRemoveHooks(log)),
     vscode.commands.registerCommand('claudeNotifications.setupGitignore', () => cmdSetupGitignore(log)),
-    vscode.commands.registerCommand('claudeNotifications.testNotification', () => cmdTestNotification(log))
+    vscode.commands.registerCommand('claudeNotifications.testNotification', () => cmdTestNotification(context, log)),
+    vscode.commands.registerCommand('claudeNotifications.toggleMute', () => {
+      const config = readConfig();
+      config.muted = !config.muted;
+      writeConfig(config);
+      updateStatusBar(statusBarItem);
+      const state = config.muted ? 'muted' : 'unmuted';
+      log.appendLine(`Notifications ${state}`);
+      vscode.window.showInformationMessage(`Claude Notifications: ${config.muted ? 'Muted' : 'Unmuted'}`);
+    })
   );
 
   // --- Signal file watcher (polling) ---
+  // When signal detected: focus the correct terminal.
+  // Sound + OS notification are already handled by hook.js (outside VS Code).
 
   const timer = setInterval(() => {
     if (!vscode.workspace.workspaceFolders) return;
@@ -51,8 +72,8 @@ function activate(context) {
 
   context.subscriptions.push({ dispose: () => clearInterval(timer) });
 
-  // --- Window focus handler (Windows toast support) ---
-
+  // --- Window focus handler ---
+  // When user clicks the OS notification, VS Code gains focus → check for signal → focus terminal
   context.subscriptions.push(
     vscode.window.onDidChangeWindowState((state) => {
       if (state.focused) {
@@ -62,7 +83,6 @@ function activate(context) {
   );
 
   // --- First-run checks ---
-
   runFirstRunChecks(context, log);
 
   log.appendLine(`Polling every ${POLL_MS}ms for signals`);
@@ -80,7 +100,6 @@ async function handleSignal(signalPath, log) {
     return;
   }
 
-  // Delete signal file immediately to prevent re-processing
   try { fs.unlinkSync(signalPath); } catch (_) {}
 
   const signal = parseSignal(content);
@@ -91,18 +110,28 @@ async function handleSignal(signalPath, log) {
 
   log.appendLine(`Signal: event=${signal.event}, project=${signal.project}, pids=[${signal.pids.join(',')}], version=${signal.version}`);
 
-  // Play sound
-  const config = vscode.workspace.getConfiguration('claudeNotifications');
-  if (config.get('sound.enabled', true)) {
-    const volume = config.get('sound.volume', 0.5);
-    const soundName = signal.event === 'stop' ? 'task-complete' : 'notification';
-    playSound(soundName, volume);
+  // Smart check: if we're already on the correct terminal, don't disrupt
+  const activeTerminal = vscode.window.activeTerminal;
+  if (activeTerminal && vscode.window.state.focused) {
+    try {
+      const activePid = await activeTerminal.processId;
+      if (activePid && signal.pids.includes(activePid)) {
+        log.appendLine(`Already on the correct terminal — no action needed`);
+        return;
+      }
+    } catch (_) {}
   }
 
-  // Show notification
-  const action = await showNotification(signal, log);
+  // Show an in-window notification with "Focus Terminal" button
+  // This supplements the OS notification from hook.js
+  const action = await vscode.window.showInformationMessage(
+    signal.event === 'stop'
+      ? `Task completed in: ${signal.project}`
+      : `Waiting for your response in: ${signal.project}`,
+    'Focus Terminal'
+  );
 
-  if (action === 'focus') {
+  if (action === 'Focus Terminal') {
     log.appendLine('User clicked Focus Terminal');
     await focusMatchingTerminal(signal.pids, log);
   }
@@ -127,7 +156,6 @@ async function focusMatchingTerminal(pids, log) {
   const terminals = vscode.window.terminals;
   log.appendLine(`Open terminals (${terminals.length}): ${terminals.map(t => t.name).join(', ')}`);
 
-  // Try matching by PID
   for (const terminal of terminals) {
     try {
       const termPid = await terminal.processId;
@@ -139,7 +167,6 @@ async function focusMatchingTerminal(pids, log) {
     } catch (_) {}
   }
 
-  // Try matching by name
   for (const terminal of terminals) {
     const name = terminal.name.toLowerCase();
     if (name.includes('claude') || name.includes('node')) {
@@ -149,7 +176,6 @@ async function focusMatchingTerminal(pids, log) {
     }
   }
 
-  // Fallback: last terminal
   if (terminals.length > 0) {
     const lastTerminal = terminals[terminals.length - 1];
     log.appendLine(`Fallback: last terminal "${lastTerminal.name}"`);
@@ -167,6 +193,44 @@ async function showTerminal(terminal, log) {
     const active = vscode.window.activeTerminal;
     log.appendLine(`Active terminal after switch: "${active?.name || 'none'}"`);
   }, 300);
+}
+
+// --- Config file (shared with hook.js) ---
+
+function getConfigPath() {
+  return path.join(os.homedir(), '.claude', CONFIG_FILE);
+}
+
+function readConfig() {
+  try {
+    const configPath = getConfigPath();
+    if (fs.existsSync(configPath)) {
+      return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    }
+  } catch (_) {}
+  return { muted: false, soundEnabled: true, volume: 0.5 };
+}
+
+function writeConfig(config) {
+  try {
+    const configPath = getConfigPath();
+    const claudeDir = path.dirname(configPath);
+    if (!fs.existsSync(claudeDir)) {
+      fs.mkdirSync(claudeDir, { recursive: true });
+    }
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  } catch (_) {}
+}
+
+function updateStatusBar(item) {
+  const config = readConfig();
+  if (config.muted) {
+    item.text = '$(bell-slash) Claude: Muted';
+    item.tooltip = 'Claude Notifications: Muted (click to unmute)';
+  } else {
+    item.text = '$(bell) Claude: Notify';
+    item.tooltip = 'Claude Notifications: Active (click to mute)';
+  }
 }
 
 // --- Commands ---
@@ -201,7 +265,6 @@ async function cmdSetupHooks(context, log) {
     log.appendLine(`Hooks installed. Backup: ${result.backupPath}`);
     vscode.window.showInformationMessage(result.message);
 
-    // Also check gitignore
     const gitStatus = checkGitignoreStatus();
     if (!gitStatus.configured) {
       const gitChoice = await vscode.window.showInformationMessage(
@@ -244,23 +307,17 @@ async function cmdSetupGitignore(log) {
   }
 }
 
-async function cmdTestNotification(log) {
-  const testSignal = {
-    version: 2,
-    event: 'notification',
-    project: 'Test Project',
-    projectDir: '',
-    pids: [],
-    timestamp: Date.now()
-  };
-
-  const config = vscode.workspace.getConfiguration('claudeNotifications');
-  if (config.get('sound.enabled', true)) {
-    playSound('notification', config.get('sound.volume', 0.5));
-  }
-
-  await showNotification(testSignal, log);
-  log.appendLine('Test notification sent');
+async function cmdTestNotification(context, log) {
+  // Run hook.js directly to test the full notification flow
+  const hookPath = path.join(context.extensionPath, 'hook.js');
+  const { execFile } = require('child_process');
+  execFile('node', [hookPath], {
+    env: { ...process.env, CLAUDE_PROJECT_DIR: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir() },
+    input: '{"hook_event_name":"Notification"}'
+  }, (err) => {
+    if (err) log.appendLine(`Test notification error: ${err.message}`);
+    else log.appendLine('Test notification sent via hook.js');
+  });
 }
 
 // --- First-run checks ---
@@ -268,7 +325,6 @@ async function cmdTestNotification(log) {
 async function runFirstRunChecks(context, log) {
   const config = vscode.workspace.getConfiguration('claudeNotifications');
 
-  // Check 1: Are hooks installed?
   if (config.get('autoSetupHooks', true)) {
     const status = checkHookStatus(context.extensionPath);
     log.appendLine(`Hook status: ${status}`);
@@ -295,19 +351,6 @@ async function runFirstRunChecks(context, log) {
       } else if (choice === "Don't Ask Again") {
         await config.update('autoSetupHooks', false, vscode.ConfigurationTarget.Global);
       }
-    }
-  }
-
-  // Check 2: Native notifications
-  const nativeEnabled = isNativeNotificationsEnabled();
-  if (nativeEnabled === false) {
-    const choice = await vscode.window.showInformationMessage(
-      'Claude Notifications: VS Code native notifications are disabled. Enable them for OS-level alerts when VS Code is in the background?',
-      'Open Settings', 'Use Fallback Only', 'Dismiss'
-    );
-
-    if (choice === 'Open Settings') {
-      await vscode.commands.executeCommand('workbench.action.openSettings', 'window.nativeNotifications');
     }
   }
 }

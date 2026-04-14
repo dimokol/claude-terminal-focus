@@ -2,7 +2,7 @@
   "name": "claude-notifications",
   "displayName": "Claude Notifications",
   "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
@@ -37,6 +37,9 @@
     "ai-coding",
     "developer-tools"
   ],
+  "extensionDependencies": [
+    "anthropic.claude-code"
+  ],
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -61,6 +64,10 @@
       {
         "command": "claudeNotifications.testNotification",
         "title": "Claude Notifications: Test Notification"
+      },
+      {
+        "command": "claudeNotifications.toggleMute",
+        "title": "Claude Notifications: Toggle Mute"
       }
     ],
     "configuration": {
@@ -77,11 +84,6 @@
           "minimum": 0,
           "maximum": 1,
           "description": "Sound volume (0.0 to 1.0, macOS/Linux only)"
-        },
-        "claudeNotifications.notification.useFallback": {
-          "type": "boolean",
-          "default": true,
-          "description": "Use OS-native notifications (via node-notifier) as fallback when VS Code window is focused. Respects OS notification preferences — never bypasses DND or mute."
         },
         "claudeNotifications.autoSetupHooks": {
           "type": "boolean",
