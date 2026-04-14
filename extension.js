@@ -1,4 +1,4 @@
-// extension.js — Claude Terminal Focus v2.0
+// extension.js — Claude Notifications v2.0
 const vscode = require('vscode');
 const fs = require('fs');
 const { getSignalPath, getClickedPath, parseSignal } = require('./lib/signals');
@@ -10,17 +10,17 @@ const { checkGitignoreStatus, setupGitignore } = require('./lib/gitignore-setup'
 const POLL_MS = 800;
 
 function activate(context) {
-  const log = vscode.window.createOutputChannel('Claude Terminal Focus');
-  log.appendLine('Claude Terminal Focus v2.0 activated');
+  const log = vscode.window.createOutputChannel('Claude Notifications');
+  log.appendLine('Claude Notifications v2.0 activated');
   log.appendLine(`Workspace folders: ${(vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath).join(', ') || 'none'}`);
 
   // --- Register commands ---
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('claudeTerminalFocus.setupHooks', () => cmdSetupHooks(context, log)),
-    vscode.commands.registerCommand('claudeTerminalFocus.removeHooks', () => cmdRemoveHooks(log)),
-    vscode.commands.registerCommand('claudeTerminalFocus.setupGitignore', () => cmdSetupGitignore(log)),
-    vscode.commands.registerCommand('claudeTerminalFocus.testNotification', () => cmdTestNotification(log))
+    vscode.commands.registerCommand('claudeNotifications.setupHooks', () => cmdSetupHooks(context, log)),
+    vscode.commands.registerCommand('claudeNotifications.removeHooks', () => cmdRemoveHooks(log)),
+    vscode.commands.registerCommand('claudeNotifications.setupGitignore', () => cmdSetupGitignore(log)),
+    vscode.commands.registerCommand('claudeNotifications.testNotification', () => cmdTestNotification(log))
   );
 
   // --- Signal file watcher (polling) ---
@@ -92,7 +92,7 @@ async function handleSignal(signalPath, log) {
   log.appendLine(`Signal: event=${signal.event}, project=${signal.project}, pids=[${signal.pids.join(',')}], version=${signal.version}`);
 
   // Play sound
-  const config = vscode.workspace.getConfiguration('claudeTerminalFocus');
+  const config = vscode.workspace.getConfiguration('claudeNotifications');
   if (config.get('sound.enabled', true)) {
     const volume = config.get('sound.volume', 0.5);
     const soundName = signal.event === 'stop' ? 'task-complete' : 'notification';
@@ -175,14 +175,14 @@ async function cmdSetupHooks(context, log) {
   const status = checkHookStatus(context.extensionPath);
 
   if (status === 'installed') {
-    vscode.window.showInformationMessage('Claude Terminal Focus hooks are already installed.');
+    vscode.window.showInformationMessage('Claude Notifications hooks are already installed.');
     return;
   }
 
   let replaceLegacy = false;
   if (status === 'legacy') {
     const choice = await vscode.window.showInformationMessage(
-      'Legacy Claude Terminal Focus hooks detected (shell scripts). Replace with the new Node.js hooks?',
+      'Legacy Claude Notifications hooks detected (shell scripts). Replace with the new Node.js hooks?',
       'Replace', 'Keep Both', 'Cancel'
     );
     if (choice === 'Cancel' || !choice) return;
@@ -220,7 +220,7 @@ async function cmdSetupHooks(context, log) {
 
 async function cmdRemoveHooks(log) {
   const choice = await vscode.window.showWarningMessage(
-    'Remove Claude Terminal Focus hooks from ~/.claude/settings.json?',
+    'Remove Claude Notifications hooks from ~/.claude/settings.json?',
     'Remove', 'Cancel'
   );
   if (choice !== 'Remove') return;
@@ -254,7 +254,7 @@ async function cmdTestNotification(log) {
     timestamp: Date.now()
   };
 
-  const config = vscode.workspace.getConfiguration('claudeTerminalFocus');
+  const config = vscode.workspace.getConfiguration('claudeNotifications');
   if (config.get('sound.enabled', true)) {
     playSound('notification', config.get('sound.volume', 0.5));
   }
@@ -266,7 +266,7 @@ async function cmdTestNotification(log) {
 // --- First-run checks ---
 
 async function runFirstRunChecks(context, log) {
-  const config = vscode.workspace.getConfiguration('claudeTerminalFocus');
+  const config = vscode.workspace.getConfiguration('claudeNotifications');
 
   // Check 1: Are hooks installed?
   if (config.get('autoSetupHooks', true)) {
@@ -275,7 +275,7 @@ async function runFirstRunChecks(context, log) {
 
     if (status === 'not-installed' || status === 'no-file') {
       const choice = await vscode.window.showInformationMessage(
-        'Claude Terminal Focus: Set up Claude Code hooks for automatic notifications?',
+        'Claude Notifications: Set up Claude Code hooks for automatic notifications?',
         'Set Up Now', 'Later', "Don't Ask Again"
       );
 
@@ -286,7 +286,7 @@ async function runFirstRunChecks(context, log) {
       }
     } else if (status === 'legacy') {
       const choice = await vscode.window.showInformationMessage(
-        'Claude Terminal Focus: You have legacy shell-script hooks. Upgrade to the new Node.js hooks for cross-platform support?',
+        'Claude Notifications: You have legacy shell-script hooks. Upgrade to the new Node.js hooks for cross-platform support?',
         'Upgrade', 'Later', "Don't Ask Again"
       );
 
@@ -302,7 +302,7 @@ async function runFirstRunChecks(context, log) {
   const nativeEnabled = isNativeNotificationsEnabled();
   if (nativeEnabled === false) {
     const choice = await vscode.window.showInformationMessage(
-      'Claude Terminal Focus: VS Code native notifications are disabled. Enable them for OS-level alerts when VS Code is in the background?',
+      'Claude Notifications: VS Code native notifications are disabled. Enable them for OS-level alerts when VS Code is in the background?',
       'Open Settings', 'Use Fallback Only', 'Dismiss'
     );
 

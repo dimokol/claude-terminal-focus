@@ -1,8 +1,4 @@
-<p align="center">
-  <img src="images/icon.png" alt="Claude Terminal Focus" width="128" />
-</p>
-
-# Claude Terminal Focus
+# <img src="images/icon.png" alt="Claude Notifications" width="36" align="top" /> Claude Notifications
 
 **All-in-one Claude Code notification system — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.**
 
@@ -17,7 +13,7 @@ Works on **macOS**, **Windows**, and **Linux** with multiple VS Code windows and
 ## Quick Start
 
 1. **Install** from the VS Code Marketplace:
-   - Extensions (Ctrl/Cmd+Shift+X) → Search **"Claude Terminal Focus"** → Install
+   - Extensions (Ctrl/Cmd+Shift+X) → Search **"Claude Notifications"** → Install
 
 2. **Set up hooks** — on first activation, the extension will prompt you:
 
@@ -25,7 +21,7 @@ Works on **macOS**, **Windows**, and **Linux** with multiple VS Code windows and
 
    That's it. The extension installs everything automatically.
 
-   Or run manually: `Ctrl/Cmd+Shift+P` → **"Claude Terminal Focus: Set Up Claude Code Hooks"**
+   Or run manually: `Ctrl/Cmd+Shift+P` → **"Claude Notifications: Set Up Claude Code Hooks"**
 
 ## How It Works
 
@@ -78,10 +74,10 @@ Open the command palette (`Ctrl/Cmd+Shift+P`) and search for:
 
 | Command | Description |
 |---------|-------------|
-| **Claude Terminal Focus: Set Up Claude Code Hooks** | Install hooks in `~/.claude/settings.json` |
-| **Claude Terminal Focus: Remove Claude Code Hooks** | Remove hooks (keeps other settings intact) |
-| **Claude Terminal Focus: Add Signal Files to Global Gitignore** | Prevent signal files from showing in git |
-| **Claude Terminal Focus: Test Notification** | Send a test notification to verify your setup |
+| **Claude Notifications: Set Up Claude Code Hooks** | Install hooks in `~/.claude/settings.json` |
+| **Claude Notifications: Remove Claude Code Hooks** | Remove hooks (keeps other settings intact) |
+| **Claude Notifications: Add Signal Files to Global Gitignore** | Prevent signal files from showing in git |
+| **Claude Notifications: Test Notification** | Send a test notification to verify your setup |
 
 ## Upgrading from v1.x
 
@@ -100,7 +96,7 @@ If you previously used the shell-script based setup:
 | No notifications | Run **"Test Notification"** from the command palette |
 | No sound | Check Settings → `claudeTerminalFocus.sound.enabled` |
 | Notifications only appear inside VS Code | Enable native notifications (see above) |
-| Extension not activating | Output panel → "Claude Terminal Focus" dropdown |
+| Extension not activating | Output panel → "Claude Notifications" dropdown |
 | Wrong terminal focused | Check Output panel PID matching logs |
 | Hooks not firing | Run **"Set Up Claude Code Hooks"** command. Restart Claude Code after setup. |
 

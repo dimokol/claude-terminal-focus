@@ -1,18 +1,18 @@
 {
-  "name": "claude-terminal-focus",
-  "displayName": "Claude Terminal Focus",
-  "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero dependencies.",
+  "name": "claude-notifications",
+  "displayName": "Claude Notifications",
+  "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.",
   "version": "2.0.0",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dimokol/claude-terminal-focus"
+    "url": "https://github.com/dimokol/claude-notifications"
   },
   "bugs": {
-    "url": "https://github.com/dimokol/claude-terminal-focus/issues"
+    "url": "https://github.com/dimokol/claude-notifications/issues"
   },
-  "homepage": "https://github.com/dimokol/claude-terminal-focus#readme",
+  "homepage": "https://github.com/dimokol/claude-notifications#readme",
   "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.80.0"
@@ -23,14 +23,19 @@
   "keywords": [
     "claude",
     "claude-code",
+    "claude-cli",
     "terminal",
     "focus",
     "notification",
+    "notifications",
     "anthropic",
     "ai",
     "productivity",
     "sound",
-    "alert"
+    "alert",
+    "toast",
+    "ai-coding",
+    "developer-tools"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -42,43 +47,43 @@
   "contributes": {
     "commands": [
       {
-        "command": "claudeTerminalFocus.setupHooks",
-        "title": "Claude Terminal Focus: Set Up Claude Code Hooks"
+        "command": "claudeNotifications.setupHooks",
+        "title": "Claude Notifications: Set Up Claude Code Hooks"
       },
       {
-        "command": "claudeTerminalFocus.removeHooks",
-        "title": "Claude Terminal Focus: Remove Claude Code Hooks"
+        "command": "claudeNotifications.removeHooks",
+        "title": "Claude Notifications: Remove Claude Code Hooks"
       },
       {
-        "command": "claudeTerminalFocus.setupGitignore",
-        "title": "Claude Terminal Focus: Add Signal Files to Global Gitignore"
+        "command": "claudeNotifications.setupGitignore",
+        "title": "Claude Notifications: Add Signal Files to Global Gitignore"
       },
       {
-        "command": "claudeTerminalFocus.testNotification",
-        "title": "Claude Terminal Focus: Test Notification"
+        "command": "claudeNotifications.testNotification",
+        "title": "Claude Notifications: Test Notification"
       }
     ],
     "configuration": {
-      "title": "Claude Terminal Focus",
+      "title": "Claude Notifications",
       "properties": {
-        "claudeTerminalFocus.sound.enabled": {
+        "claudeNotifications.sound.enabled": {
           "type": "boolean",
           "default": true,
           "description": "Play a sound when Claude needs attention"
         },
-        "claudeTerminalFocus.sound.volume": {
+        "claudeNotifications.sound.volume": {
           "type": "number",
           "default": 0.5,
           "minimum": 0,
           "maximum": 1,
           "description": "Sound volume (0.0 to 1.0, macOS/Linux only)"
         },
-        "claudeTerminalFocus.notification.useFallback": {
+        "claudeNotifications.notification.useFallback": {
           "type": "boolean",
           "default": true,
           "description": "Use OS-native notifications (via node-notifier) as fallback when VS Code window is focused. Respects OS notification preferences — never bypasses DND or mute."
         },
-        "claudeTerminalFocus.autoSetupHooks": {
+        "claudeNotifications.autoSetupHooks": {
           "type": "boolean",
           "default": true,
           "description": "Prompt to install Claude Code hooks on first activation"
