@@ -373,7 +373,7 @@ async function focusMatchingTerminal(pids, log) {
   log.appendLine('No terminals found to focus');
 }
 
-function showTerminal(terminal, log) {
+async function showTerminal(terminal, log) {
   terminal.show();
   setTimeout(async () => {
     const active = vscode.window.activeTerminal;
