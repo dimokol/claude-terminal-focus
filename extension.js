@@ -373,12 +373,16 @@ async function focusMatchingTerminal(pids, log) {
   log.appendLine('No terminals found to focus');
 }
 
-async function showTerminal(terminal, log) {
-  await vscode.commands.executeCommand('workbench.action.terminal.focus');
+function showTerminal(terminal, log) {
   terminal.show();
-  setTimeout(() => {
+  setTimeout(async () => {
     const active = vscode.window.activeTerminal;
-    log.appendLine(`Active terminal after switch: "${active?.name || 'none'}"`);
+    if (!active) {
+      log.appendLine('Active terminal after switch: none');
+      return;
+    }
+    const index = vscode.window.terminals.indexOf(active);
+    log.appendLine(`Active terminal after switch: ${await describeTerminal(active, index)}`);
   }, 300);
 }
 
