@@ -3,3 +3,4 @@ node_modules/
 .vscode/.claude-focus
 .vscode/.claude-focus-clicked
 .DS_Store
+.claude/

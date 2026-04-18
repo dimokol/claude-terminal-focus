@@ -2,7 +2,7 @@
   "name": "claude-notifications",
   "displayName": "Claude Notifications",
   "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.",
-  "version": "3.0.0",
+  "version": "3.1.2",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
@@ -89,7 +89,7 @@
       },
       {
         "command": "claudeNotifications.setupMacNotifier",
-        "title": "Claude Notifications: Set Up macOS terminal-notifier (Recommended)"
+        "title": "Claude Notifications: Configure macOS terminal-notifier"
       }
     ],
     "configuration": {
@@ -98,56 +98,92 @@
         "claudeNotifications.autoSetupHooks": {
           "type": "boolean",
           "default": true,
-          "description": "Prompt to upgrade legacy shell-script hooks on activation"
+          "markdownDescription": "Install and upgrade Claude Code hooks automatically. Uncheck to be prompted before any change to `~/.claude/settings.json`."
         },
-        "claudeNotifications.events.waiting": {
-          "type": "string",
-          "enum": [
-            "Sound + Notification",
-            "Sound only",
-            "Notification only",
-            "Nothing"
-          ],
-          "default": "Sound + Notification",
-          "description": "What happens when Claude needs your response (Notification + PermissionRequest events)"
-        },
-        "claudeNotifications.events.completed": {
-          "type": "string",
-          "enum": [
-            "Sound + Notification",
-            "Sound only",
-            "Notification only",
-            "Nothing"
-          ],
-          "default": "Sound + Notification",
-          "description": "What happens when Claude finishes a task (Stop event)"
-        },
-        "claudeNotifications.sounds.waiting": {
-          "type": "string",
-          "default": "bundled:notification",
-          "markdownDescription": "Sound when Claude needs your response. Values: `bundled:notification`, `bundled:task-complete`, `system:<name>` (e.g. `system:Glass`), `custom` (uses path below), or `none`. Run **Claude Notifications: Choose Sound** to browse."
-        },
-        "claudeNotifications.sounds.waitingPath": {
-          "type": "string",
-          "default": "",
-          "description": "Path to custom sound file (when sounds.waiting is 'custom')"
-        },
-        "claudeNotifications.sounds.completed": {
-          "type": "string",
-          "default": "bundled:task-complete",
-          "markdownDescription": "Sound when Claude finishes a task. Same values as `sounds.waiting`."
-        },
-        "claudeNotifications.sounds.completedPath": {
-          "type": "string",
-          "default": "",
-          "description": "Path to custom sound file (when sounds.completed is 'custom')"
-        },
-        "claudeNotifications.sounds.volume": {
+        "claudeNotifications.volume": {
           "type": "number",
           "default": 50,
           "minimum": 0,
           "maximum": 100,
-          "description": "Sound volume (0 = silent, 100 = max)"
+          "markdownDescription": "`0` = silent, `50` (default) ≈ typical OS notification, `100` = the sound file's native level. Your OS master volume still controls overall loudness."
+        },
+        "claudeNotifications.waiting.action": {
+          "type": "string",
+          "enum": [
+            "Sound + Notification",
+            "Sound only",
+            "Notification only",
+            "Nothing"
+          ],
+          "default": "Sound + Notification",
+          "description": "What happens when Claude is waiting for your response."
+        },
+        "claudeNotifications.waiting.sound": {
+          "type": "string",
+          "enum": [
+            "none",
+            "bundled:notification",
+            "bundled:task-complete",
+            "custom"
+          ],
+          "enumItemLabels": [
+            "Silent — no sound",
+            "Bundled · Notification (default)",
+            "Bundled · Task Complete",
+            "Custom file — see Custom Sound Path below"
+          ],
+          "enumDescriptions": [
+            "Toast/banner still shows but no sound plays.",
+            "Cross-platform bundled chime designed for 'waiting' events.",
+            "Cross-platform bundled chime designed for 'completed' events.",
+            "Use the audio file at the Custom Sound Path below."
+          ],
+          "default": "bundled:notification",
+          "markdownDescription": "Sound for this event. [**Choose Sound…**](command:claudeNotifications.chooseSound?%5B%22waiting%22%5D) picks from your OS's system sounds with click-to-preview; [**Preview**](command:claudeNotifications.previewSound) plays your current sounds."
+        },
+        "claudeNotifications.waiting.customSoundPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to a custom audio file. Used only when the Sound above is set to `Custom file`."
+        },
+        "claudeNotifications.completed.action": {
+          "type": "string",
+          "enum": [
+            "Sound + Notification",
+            "Sound only",
+            "Notification only",
+            "Nothing"
+          ],
+          "default": "Sound + Notification",
+          "description": "What happens when Claude finishes a task."
+        },
+        "claudeNotifications.completed.sound": {
+          "type": "string",
+          "enum": [
+            "none",
+            "bundled:notification",
+            "bundled:task-complete",
+            "custom"
+          ],
+          "enumItemLabels": [
+            "Silent — no sound",
+            "Bundled · Notification",
+            "Bundled · Task Complete (default)",
+            "Custom file — see Custom Sound Path below"
+          ],
+          "enumDescriptions": [
+            "Toast/banner still shows but no sound plays.",
+            "Cross-platform bundled chime designed for 'waiting' events.",
+            "Cross-platform bundled chime designed for 'completed' events.",
+            "Use the audio file at the Custom Sound Path below."
+          ],
+          "default": "bundled:task-complete",
+          "markdownDescription": "Sound for this event. [**Choose Sound…**](command:claudeNotifications.chooseSound?%5B%22completed%22%5D) picks from your OS's system sounds with click-to-preview; [**Preview**](command:claudeNotifications.previewSound) plays your current sounds."
+        },
+        "claudeNotifications.completed.customSoundPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to a custom audio file. Used only when the Sound above is set to `Custom file`."
         },
         "claudeNotifications.soundWhenFocused": {
           "type": "string",
@@ -155,12 +191,20 @@
             "sound",
             "nothing"
           ],
+          "enumItemLabels": [
+            "Play sound",
+            "Stay silent"
+          ],
+          "enumDescriptions": [
+            "Play the configured audio cue even when you're already on the matching terminal.",
+            "No sound or toast when you're already on the matching terminal."
+          ],
           "default": "sound",
-          "description": "What to do when you're already on the correct terminal. 'sound' plays an audio cue, 'nothing' stays silent."
+          "description": "What to do when you're already on the terminal Claude just wrote to."
         },
         "claudeNotifications.macOS.setup": {
           "type": "null",
-          "markdownDescription": "macOS banners need `terminal-notifier` for click-to-open. [Run setup (Recommended)](command:claudeNotifications.setupMacNotifier)"
+          "markdownDescription": "macOS only. [Configure terminal-notifier](command:claudeNotifications.setupMacNotifier) for click-to-open banners."
         }
       }
     }

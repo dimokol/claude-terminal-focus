@@ -3,23 +3,39 @@
 // Called by Claude Code on Stop, Notification, and PermissionRequest events.
 //
 // Flow:
-// 1. Write JSON signal file (.vscode/.claude-focus)
-// 2. Sleep HANDSHAKE_MS (1200ms) — give extension time to claim
-// 3. Check for claim marker (.vscode/.claude-focus-claimed)
-//    - If claimed: extension handled it → exit silently
-//    - If not claimed: fire OS banner + play sound (fallback)
+// 1. Write JSON signal file (.vscode/.claude-focus) with state=pending
+// 2. Sleep HANDSHAKE_MS (1200ms) — give the extension time to claim
+// 3. Atomically try to claim the handled-marker:
+//    - If the extension already claimed it: exit silently (ext handled).
+//    - If a sibling hook (different event, fired near-simultaneously)
+//      already claimed it: exit silently — a single notification already
+//      covers this Claude "turn".
+// 4. Mark the signal as fired (so the extension, if it later polls after
+//    the user returns to VS Code, ignores this signal instead of firing a
+//    duplicate toast).
+// 5. Fire OS banner + play sound (fallback).
 
 const fs = require('fs');
 const path = require('path');
 const { execSync, execFile, spawn } = require('child_process');
 const os = require('os');
 const { setTimeout: sleep } = require('node:timers/promises');
+const {
+  SIGNAL_DIR,
+  SIGNAL_FILE,
+  CLICKED_FILE,
+  CLAIMED_FILE,
+  claimHandled,
+  eventPriority
+} = require('./lib/signals');
 
-const SIGNAL_DIR = '.vscode';
-const SIGNAL_FILE = '.claude-focus';
-const CLAIMED_FILE = '.claude-focus-claimed';
 const CONFIG_FILE = 'claude-notifications-config.json';
 const DEFAULT_HANDSHAKE_MS = 1200;
+
+// Shell-escape a single argument (POSIX single-quote style).
+function shEsc(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
 
 (async () => {
   // --- 1. Read input ---
@@ -73,6 +89,10 @@ const DEFAULT_HANDSHAKE_MS = 1200;
     fs.mkdirSync(signalDirPath, { recursive: true });
   }
 
+  const signalPath = path.join(signalDirPath, SIGNAL_FILE);
+  const claimPath = path.join(signalDirPath, CLAIMED_FILE);
+  const clickedPath = path.join(signalDirPath, CLICKED_FILE);
+
   // --- 4. Build PID ancestor chain ---
 
   function getPidChain() {
@@ -111,21 +131,39 @@ const DEFAULT_HANDSHAKE_MS = 1200;
   }
 
   // --- 5. Write signal file ---
+  // If another hook (for a concurrent event) already wrote a signal with a
+  // higher-priority event, preserve it. This makes "waiting" (user action
+  // required) win over "completed" (just-finished) when both fire together.
 
-  const signalPayload = {
-    version: 2,
-    event: hookEvent,
-    project: projectName,
-    projectDir: projectDir,
-    workspaceRoot: workspaceRoot,
-    pids: getPidChain(),
-    timestamp: Date.now()
-  };
+  const pids = getPidChain();
+  let shouldWriteSignal = true;
+  try {
+    const existing = JSON.parse(fs.readFileSync(signalPath, 'utf8'));
+    if (
+      existing.timestamp &&
+      Date.now() - existing.timestamp < DEFAULT_HANDSHAKE_MS + 1000 &&
+      eventPriority(existing.event) > eventPriority(hookEvent)
+    ) {
+      shouldWriteSignal = false;
+    }
+  } catch (_) {}
 
-  const signalPath = path.join(signalDirPath, SIGNAL_FILE);
-  fs.writeFileSync(signalPath, JSON.stringify(signalPayload, null, 2));
+  if (shouldWriteSignal) {
+    const signalPayload = {
+      version: 2,
+      event: hookEvent,
+      project: projectName,
+      projectDir: projectDir,
+      workspaceRoot: workspaceRoot,
+      pids,
+      state: 'pending',
+      timestamp: Date.now()
+    };
+    fs.writeFileSync(signalPath, JSON.stringify(signalPayload, null, 2));
+  }
 
-  // If muted, signal file written (for terminal focus) but skip everything else
+  // If muted, the signal file is written (useful for Focus Terminal if
+  // the user opens VS Code and chooses to engage) but skip the rest.
   if (isMuted) process.exit(0);
 
   // --- 6. Per-event settings ---
@@ -147,31 +185,72 @@ const DEFAULT_HANDSHAKE_MS = 1200;
   const handshakeMs = config.handshakeMs || DEFAULT_HANDSHAKE_MS;
   await sleep(handshakeMs);
 
-  const claimPath = path.join(signalDirPath, CLAIMED_FILE);
-  if (fs.existsSync(claimPath)) {
-    // Extension claimed the signal — it handled toast + sound
-    try { fs.unlinkSync(claimPath); } catch (_) {}
+  // Priority defer: if the signal on disk now reflects a higher-priority
+  // event from a sibling hook, let that hook fire instead.
+  try {
+    const onDisk = JSON.parse(fs.readFileSync(signalPath, 'utf8'));
+    if (onDisk.event && eventPriority(onDisk.event) > eventPriority(hookEvent)) {
+      process.exit(0);
+    }
+  } catch (_) {
+    // Signal deleted — extension claimed. Exit silently.
     process.exit(0);
   }
 
-  // --- 8. Fallback: extension didn't claim → fire OS banner + sound ---
+  // Atomically claim the right to fire. Either the extension already
+  // claimed it (during the handshake) or a sibling hook.js did — in either
+  // case we exit silently so the user sees exactly one notification.
+  if (!claimHandled(claimPath)) {
+    process.exit(0);
+  }
 
-  // Play sound
+  // Mark the signal as fired so if the user later focuses VS Code, the
+  // extension's polling loop ignores this signal instead of firing a
+  // duplicate in-window toast. The signal file is kept (not deleted) so
+  // the click-to-focus flow can still read the PIDs.
+  try {
+    const onDisk = JSON.parse(fs.readFileSync(signalPath, 'utf8'));
+    onDisk.state = 'fired';
+    fs.writeFileSync(signalPath, JSON.stringify(onDisk, null, 2));
+  } catch (_) {}
+
+  // --- 8. Fallback: fire OS banner + sound ---
+
+  // Play sound. See lib/sounds.js for the volume-mapping rationale:
+  // 0–100 → 0.0–1.0 amplitude multiplier (not 0–255). afplay -v above
+  // ~1.0 clips hard, which was the root cause of the v3.0 loudness bug.
   if (shouldPlaySound) {
     const soundPath = config.sounds && config.sounds[hookEvent];
-    const volume = (config.sounds && config.sounds.volume != null) ? config.sounds.volume : 50;
+    const rawVolume = (config.sounds && config.sounds.volume != null) ? config.sounds.volume : 50;
+    const volume = Math.max(0, Math.min(100, Number(rawVolume) || 0));
     const fileToPlay = soundPath || path.join(path.dirname(__filename), 'sounds', `${eventInfo.sound}.wav`);
 
-    if (fs.existsSync(fileToPlay)) {
+    if (volume > 0 && fs.existsSync(fileToPlay)) {
       try {
         if (process.platform === 'darwin') {
-          const vol = Math.round((volume / 100) * 255).toString();
+          const vol = (volume / 100).toFixed(3);
           execFile('afplay', ['-v', vol, fileToPlay], () => {});
         } else if (process.platform === 'win32') {
-          const psCmd = `(New-Object System.Media.SoundPlayer '${fileToPlay.replace(/'/g, "''")}').PlaySync()`;
+          const esc = fileToPlay.replace(/'/g, "''");
+          const vol = (volume / 100).toFixed(3);
+          const psCmd = `
+            try {
+              Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+              $p = New-Object System.Windows.Media.MediaPlayer
+              $p.Open([System.Uri]::new('${esc}', [System.UriKind]::Absolute))
+              $p.Volume = ${vol}
+              while (-not $p.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 20 }
+              $ms = [int]$p.NaturalDuration.TimeSpan.TotalMilliseconds + 150
+              $p.Play()
+              Start-Sleep -Milliseconds $ms
+              $p.Close()
+            } catch {
+              (New-Object System.Media.SoundPlayer '${esc}').PlaySync()
+            }`.trim();
           execFile('powershell', ['-NoProfile', '-Command', psCmd], () => {});
         } else {
-          execFile('paplay', [fileToPlay], (err) => {
+          const paVol = String(Math.round((volume / 100) * 65536));
+          execFile('paplay', ['--volume', paVol, fileToPlay], (err) => {
             if (err) execFile('aplay', [fileToPlay], () => {});
           });
         }
@@ -198,16 +277,20 @@ const DEFAULT_HANDSHAKE_MS = 1200;
     const codeCli = findCodeCli();
     try {
       execSync('command -v terminal-notifier', { stdio: 'ignore' });
+      // On click: drop a "clicked" marker (so the extension knows to focus
+      // the terminal without showing an extra in-window toast) then open
+      // the workspace.
+      const executeCmd = `/usr/bin/touch ${shEsc(clickedPath)} && ${shEsc(codeCli)} ${shEsc(workspaceRoot)}`;
       const child = spawn('terminal-notifier', [
         '-title', eventInfo.title,
         '-message', eventInfo.message,
-        '-execute', `${codeCli} '${workspaceRoot}'`,
+        '-execute', executeCmd,
         '-group', `claude-${projectName}`,
       ], { detached: true, stdio: 'ignore' });
       child.unref();
     } catch (_) {
       try {
-        execSync(`osascript -e 'display notification "${eventInfo.message}" with title "${eventInfo.title}" sound name "default"'`, {
+        execSync(`osascript -e 'display notification "${eventInfo.message}" with title "${eventInfo.title}"'`, {
           timeout: 3000, stdio: 'ignore'
         });
       } catch (_) {}

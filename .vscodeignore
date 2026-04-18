@@ -1,9 +1,11 @@
 .git/**
 .github/**
+.vscode/**
 scripts/**
 docs/**
 node_modules/**
 extension.js
+hook.js
 lib/**
 esbuild.js
 *.vsix
