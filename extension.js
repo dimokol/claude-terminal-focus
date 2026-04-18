@@ -153,7 +153,10 @@ async function handleSignal(signalPath, workspaceRoot, log) {
   // Already fired by hook.js — ignore. Cleanup happens in sweepFiredSignal.
   if (signal.state === 'fired') return;
 
-  log.appendLine(`Signal: event=${signal.event}, project=${signal.project}, pids=[${signal.pids.join(',')}], version=${signal.version}`);
+  const rawEvent = signal.hookEventName || '?';
+  const sessionTag = signal.sessionId ? signal.sessionId.slice(0, 8) : '?';
+  log.appendLine(`Signal: event=${signal.event}(${rawEvent}), session=${sessionTag}, project=${signal.project}, pids=[${signal.pids.join(',')}], version=${signal.version}`);
+  if (signal.hookMessage) log.appendLine(`  message: ${signal.hookMessage}`);
 
   const config = readConfig();
   const eventSetting = (config.events && config.events[signal.event]) || 'Sound + Notification';
@@ -247,7 +250,9 @@ async function handleClickedSignal(workspaceRoot, log) {
   try { fs.unlinkSync(getClaimedPath(workspaceRoot)); } catch (_) {}
 
   if (signal && signal.pids.length > 0) {
-    log.appendLine(`Click-to-focus — project=${signal.project}, pids=[${signal.pids.join(',')}]`);
+    const rawEvent = signal.hookEventName || '?';
+    const sessionTag = signal.sessionId ? signal.sessionId.slice(0, 8) : '?';
+    log.appendLine(`Click-to-focus — event=${signal.event}(${rawEvent}), session=${sessionTag}, project=${signal.project}, pids=[${signal.pids.join(',')}]`);
     await focusMatchingTerminal(signal.pids, log);
   }
 }

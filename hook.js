@@ -44,10 +44,16 @@ function shEsc(s) {
   const projectName = path.basename(projectDir);
 
   let hookEvent = 'waiting';
+  let hookEventName = '';
+  let hookMessage = '';
+  let sessionId = '';
   try {
     const stdinData = fs.readFileSync(0, 'utf8');
     const input = JSON.parse(stdinData);
-    const eventName = (input.hook_event_name || '').toLowerCase();
+    hookEventName = input.hook_event_name || '';
+    hookMessage = typeof input.message === 'string' ? input.message : '';
+    sessionId = input.session_id || '';
+    const eventName = hookEventName.toLowerCase();
     if (eventName === 'stop') hookEvent = 'completed';
     else hookEvent = 'waiting'; // notification, permissionrequest, etc.
   } catch (_) {}
@@ -152,6 +158,9 @@ function shEsc(s) {
     const signalPayload = {
       version: 2,
       event: hookEvent,
+      hookEventName,
+      hookMessage,
+      sessionId,
       project: projectName,
       projectDir: projectDir,
       workspaceRoot: workspaceRoot,
