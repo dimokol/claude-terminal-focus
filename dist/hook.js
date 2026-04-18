@@ -65,6 +65,9 @@ var require_signals = __commonJS({
             return {
               version: 2,
               event: normalizeEvent(data.event || "notification"),
+              hookEventName: typeof data.hookEventName === "string" ? data.hookEventName : "",
+              hookMessage: typeof data.hookMessage === "string" ? data.hookMessage : "",
+              sessionId: typeof data.sessionId === "string" ? data.sessionId : "",
               project: data.project || "Unknown",
               projectDir: data.projectDir || "",
               pids: Array.isArray(data.pids) ? data.pids : [],
@@ -79,6 +82,9 @@ var require_signals = __commonJS({
       return {
         version: 1,
         event: "waiting",
+        hookEventName: "",
+        hookMessage: "",
+        sessionId: "",
         project: "Claude Code",
         projectDir: "",
         pids,
@@ -128,10 +134,16 @@ function shEsc(s) {
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const projectName = path.basename(projectDir);
   let hookEvent = "waiting";
+  let hookEventName = "";
+  let hookMessage = "";
+  let sessionId = "";
   try {
     const stdinData = fs.readFileSync(0, "utf8");
     const input = JSON.parse(stdinData);
-    const eventName = (input.hook_event_name || "").toLowerCase();
+    hookEventName = input.hook_event_name || "";
+    hookMessage = typeof input.message === "string" ? input.message : "";
+    sessionId = input.session_id || "";
+    const eventName = hookEventName.toLowerCase();
     if (eventName === "stop") hookEvent = "completed";
     else hookEvent = "waiting";
   } catch (_) {
@@ -218,6 +230,9 @@ function shEsc(s) {
     const signalPayload = {
       version: 2,
       event: hookEvent,
+      hookEventName,
+      hookMessage,
+      sessionId,
       project: projectName,
       projectDir,
       workspaceRoot,
