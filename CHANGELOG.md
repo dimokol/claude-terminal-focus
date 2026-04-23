@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.1.3] - 2026-04-23
+
+### Fixed
+- **terminal-notifier / Homebrew detection on macOS.** When VS Code is launched from the Dock or Finder it inherits a minimal `launchd` PATH that doesn't include `/opt/homebrew/bin`, so `command -v terminal-notifier` and `command -v brew` both returned empty even when both were installed. The Mac Setup pane therefore showed the "Configure terminal-notifier" prompt for users who already had it, and clicking **Install** then reported "Homebrew not found." Detection now probes `/opt/homebrew/bin`, `/usr/local/bin`, and `/opt/local/bin` directly via `fs.accessSync` before falling back to the shell lookup, and the brew install command uses the absolute `brewPath` so the setup terminal doesn't depend on PATH either.
+
+### Changed
+- **Activation log reads the version from `package.json`** instead of a hardcoded `v3.1` string, so the Output channel header always matches the installed build.
+
 ## [3.1.2] - 2026-04-16
 
 ### Breaking — settings keys renamed (no auto-migration)

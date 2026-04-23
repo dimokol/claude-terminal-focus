@@ -1,6 +1,7 @@
 .git/**
 .github/**
 .vscode/**
+.claude/**
 scripts/**
 docs/**
 node_modules/**

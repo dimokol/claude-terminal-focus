@@ -1,4 +1,4 @@
-// extension.js — Claude Notifications v3.1
+// extension.js — Claude Notifications v3.1.3
 // hook.js handles OS banner + sound as a fallback (runs outside VS Code).
 // This extension handles: atomic claim-based dedup, terminal focusing,
 // status bar, settings sync, and commands.
@@ -33,7 +33,7 @@ let _terminalNotifierCached = null;  // cached detection, invalidated on command
 
 function activate(context) {
   const log = vscode.window.createOutputChannel('Claude Notifications');
-  log.appendLine('Claude Notifications v3.1 activated');
+  log.appendLine(`Claude Notifications v${context.extension.packageJSON.version} activated`);
   log.appendLine(`Workspace folders: ${(vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath).join(', ') || 'none'}`);
 
   // --- Detect legacy extension (primary cause of duplicate toasts) ---
@@ -531,16 +531,34 @@ async function cmdTestNotification(context, log) {
 
 // --- macOS terminal-notifier setup ---
 
-function detectTerminalNotifier() {
-  if (_terminalNotifierCached !== null) return _terminalNotifierCached;
+// Common install locations for Homebrew-managed binaries on macOS.
+// VS Code launched from Finder/Dock does not inherit the shell PATH, so we
+// can't rely on `command -v` / `which` — probe known paths directly.
+const MAC_BIN_DIRS = ['/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin'];
+
+function findMacBinary(name) {
+  const fs = require('fs');
+  for (const dir of MAC_BIN_DIRS) {
+    const p = `${dir}/${name}`;
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return p;
+    } catch (_) {}
+  }
+  // Fallback: try the shell in case PATH is actually populated.
   try {
-    const stdout = require('child_process').execSync('command -v terminal-notifier', {
+    const stdout = require('child_process').execSync(`command -v ${name}`, {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
     }).trim();
-    _terminalNotifierCached = stdout || null;
+    return stdout || null;
   } catch (_) {
-    _terminalNotifierCached = null;
+    return null;
   }
+}
+
+function detectTerminalNotifier() {
+  if (_terminalNotifierCached !== null) return _terminalNotifierCached;
+  _terminalNotifierCached = findMacBinary('terminal-notifier');
   return _terminalNotifierCached;
 }
 
@@ -608,9 +626,8 @@ function openMacNotificationSettings() {
 }
 
 async function installTerminalNotifier(context, log) {
-  try {
-    require('child_process').execSync('command -v brew', { stdio: 'ignore' });
-  } catch (_) {
+  const brewPath = findMacBinary('brew');
+  if (!brewPath) {
     vscode.window.showInformationMessage(
       'Homebrew not found. Install terminal-notifier manually: https://github.com/julienXX/terminal-notifier#installation'
     );
@@ -619,7 +636,7 @@ async function installTerminalNotifier(context, log) {
 
   const terminal = vscode.window.createTerminal('Claude Notifications Setup');
   terminal.show();
-  terminal.sendText('brew install terminal-notifier && echo "\\n✅ terminal-notifier installed! You can close this terminal."');
+  terminal.sendText(`${brewPath} install terminal-notifier && echo "\\n✅ terminal-notifier installed! You can close this terminal."`);
   await context.globalState.update('macNotifierPromptAnswered', true);
   _terminalNotifierCached = null; // invalidate cache for next call
   log.appendLine('terminal-notifier install started via Homebrew');
