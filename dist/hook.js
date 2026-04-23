@@ -127,6 +127,9 @@ var {
 } = require_signals();
 var CONFIG_FILE = "claude-notifications-config.json";
 var DEFAULT_HANDSHAKE_MS = 1200;
+var SESSIONS_FILE = ".claude-focus-sessions";
+var SESSION_DEDUP_MS = 5 * 1e3;
+var SESSIONS_PRUNE_MS = 60 * 60 * 1e3;
 function shEsc(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
@@ -178,6 +181,35 @@ function shEsc(s) {
   const signalPath = path.join(signalDirPath, SIGNAL_FILE);
   const claimPath = path.join(signalDirPath, CLAIMED_FILE);
   const clickedPath = path.join(signalDirPath, CLICKED_FILE);
+  const sessionsPath = path.join(signalDirPath, SESSIONS_FILE);
+  function readSessions() {
+    try {
+      const data = JSON.parse(fs.readFileSync(sessionsPath, "utf8"));
+      return data && typeof data === "object" ? data : {};
+    } catch (_) {
+      return {};
+    }
+  }
+  function writeSessions(map) {
+    const now = Date.now();
+    for (const key of Object.keys(map)) {
+      if (now - map[key] > SESSIONS_PRUNE_MS) delete map[key];
+    }
+    try {
+      fs.writeFileSync(sessionsPath, JSON.stringify(map));
+    } catch (_) {
+    }
+  }
+  if (sessionId) {
+    const sessions = readSessions();
+    const lastNotified = sessions[sessionId];
+    const now = Date.now();
+    if (lastNotified && now - lastNotified < SESSION_DEDUP_MS) {
+      process.exit(0);
+    }
+    sessions[sessionId] = now;
+    writeSessions(sessions);
+  }
   function getPidChain() {
     const pids2 = [];
     let currentPid = process.pid;

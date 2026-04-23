@@ -16,7 +16,6 @@ esbuild.js
 !LICENSE
 .gitignore
 .vscodeignore
-.DS_Store
+**/.DS_Store
+package-lock.json
 images/icon.svg
-claude-notifications.md
-claude-terminal-focus-knowledge-sharing.md

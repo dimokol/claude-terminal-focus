@@ -1,6 +1,8 @@
 *.vsix
 node_modules/
+docs/
 .vscode/.claude-focus
 .vscode/.claude-focus-clicked
+.vscode/.claude-focus-sessions
 .DS_Store
 .claude/

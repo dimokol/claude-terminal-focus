@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.1.4] - 2026-04-23
+
+### Fixed
+- **Phantom double-notifications on Claude 2.1.x.** Recent Claude CLI builds fire duplicate hooks per turn — `Stop` immediately followed by `Notification("Claude is waiting for your input")`, `PermissionRequest` followed by `Notification("Claude needs your permission…")`, and occasionally multiple `Stop` events in rapid succession. The result was two (sometimes three) OS banners and sounds for one logical event. `hook.js` now deduplicates per `session_id` via a small on-disk map at `.vscode/.claude-focus-sessions`: the first hook in a 5-second window notifies; subsequent hooks for the same session within that window exit silently. A new turn — user response → Claude work → next event — realistically takes longer than 5 s, so legitimate notifications still fire.
+
+### Added
+- **Diagnostic fields in signals.** Signal files now carry `hookEventName`, `hookMessage`, and `sessionId` verbatim from Claude's hook stdin. The extension's Output channel logs the raw event name (e.g. `event=waiting(Notification)`) and an 8-char session tag alongside the normalized event, making it straightforward to diagnose duplicate-hook patterns from a single log paste.
+
 ## [3.1.3] - 2026-04-23
 
 ### Fixed

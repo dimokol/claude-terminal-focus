@@ -537,7 +537,6 @@ async function cmdTestNotification(context, log) {
 const MAC_BIN_DIRS = ['/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin'];
 
 function findMacBinary(name) {
-  const fs = require('fs');
   for (const dir of MAC_BIN_DIRS) {
     const p = `${dir}/${name}`;
     try {

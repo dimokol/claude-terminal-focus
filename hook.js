@@ -31,6 +31,9 @@ const {
 
 const CONFIG_FILE = 'claude-notifications-config.json';
 const DEFAULT_HANDSHAKE_MS = 1200;
+const SESSIONS_FILE = '.claude-focus-sessions';
+const SESSION_DEDUP_MS = 5 * 1000;       // 5 s: suppress any repeat hook for a session that just notified
+const SESSIONS_PRUNE_MS = 60 * 60 * 1000; // drop session entries older than 1h
 
 // Shell-escape a single argument (POSIX single-quote style).
 function shEsc(s) {
@@ -98,6 +101,45 @@ function shEsc(s) {
   const signalPath = path.join(signalDirPath, SIGNAL_FILE);
   const claimPath = path.join(signalDirPath, CLAIMED_FILE);
   const clickedPath = path.join(signalDirPath, CLICKED_FILE);
+  const sessionsPath = path.join(signalDirPath, SESSIONS_FILE);
+
+  // --- Session coalescing ---
+  // Claude 2.1.x fires duplicate hooks per turn:
+  //   (a) Stop + Notification("Claude is waiting for your input")
+  //   (b) PermissionRequest + Notification("Claude needs your permission...")
+  //   (c) Multiple Stop events in rapid succession for the same session
+  // All three patterns produce their duplicates within ~1–2 s. We suppress any
+  // hook for a session that already triggered a notification in the last 5 s.
+  // The window is short enough that a genuinely new turn (user response →
+  // Claude work → next event) — which realistically takes longer — still fires.
+  function readSessions() {
+    try {
+      const data = JSON.parse(fs.readFileSync(sessionsPath, 'utf8'));
+      return (data && typeof data === 'object') ? data : {};
+    } catch (_) {
+      return {};
+    }
+  }
+  function writeSessions(map) {
+    const now = Date.now();
+    for (const key of Object.keys(map)) {
+      if (now - map[key] > SESSIONS_PRUNE_MS) delete map[key];
+    }
+    try {
+      fs.writeFileSync(sessionsPath, JSON.stringify(map));
+    } catch (_) {}
+  }
+
+  if (sessionId) {
+    const sessions = readSessions();
+    const lastNotified = sessions[sessionId];
+    const now = Date.now();
+    if (lastNotified && now - lastNotified < SESSION_DEDUP_MS) {
+      process.exit(0);
+    }
+    sessions[sessionId] = now;
+    writeSessions(sessions);
+  }
 
   // --- 4. Build PID ancestor chain ---
 
