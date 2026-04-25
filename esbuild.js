@@ -1,32 +1,36 @@
 const esbuild = require('esbuild');
 
-// Bundle the extension (loaded by VS Code) and the hook script
-// (invoked by Claude Code from outside VS Code). Both are packaged into
-// single self-contained files so lib/** can stay out of the VSIX.
+const common = {
+  bundle: true,
+  platform: 'node',
+  target: 'node18',
+  format: 'cjs',
+  sourcemap: false
+};
+
 Promise.all([
   esbuild.build({
+    ...common,
     entryPoints: ['./extension.js'],
-    bundle: true,
     outfile: './dist/extension.js',
-    platform: 'node',
-    target: 'node18',
     external: ['vscode'],
-    format: 'cjs',
     minify: true,
     sourcemap: true
   }),
   esbuild.build({
+    ...common,
     entryPoints: ['./hook.js'],
-    bundle: true,
     outfile: './dist/hook.js',
-    platform: 'node',
-    target: 'node18',
-    format: 'cjs',
-    minify: false,   // keep readable for stack traces in Claude logs
-    sourcemap: false // invoked via `node dist/hook.js`, no shebang needed
+    minify: false
+  }),
+  esbuild.build({
+    ...common,
+    entryPoints: ['./hook-user-prompt.js'],
+    outfile: './dist/hook-user-prompt.js',
+    minify: false
   })
 ]).then(() => {
-  console.log('Build complete: dist/extension.js, dist/hook.js');
+  console.log('Build complete: dist/extension.js, dist/hook.js, dist/hook-user-prompt.js');
 }).catch((err) => {
   console.error(err);
   process.exit(1);
