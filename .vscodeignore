@@ -4,9 +4,11 @@
 .claude/**
 scripts/**
 docs/**
+test/**
 node_modules/**
 extension.js
 hook.js
+hook-user-prompt.js
 lib/**
 esbuild.js
 *.vsix
@@ -19,3 +21,4 @@ esbuild.js
 **/.DS_Store
 package-lock.json
 images/icon.svg
+CLAUDE.md

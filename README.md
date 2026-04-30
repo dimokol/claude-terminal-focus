@@ -19,37 +19,39 @@ Works on **macOS**, **Windows**, and **Linux**, across multiple VS Code windows 
 
    If you ever need to re-run setup: `Ctrl/Cmd+Shift+P` → **"Claude Notifications: Set Up Claude Code Hooks"**.
 
-## What's New in v3.1
+## What's New in v3.2
 
-- **True atomic dedup.** The hook and the extension race for a single atomic marker file (`O_EXCL`). Whoever wins fires; the other exits silently. Even two events from the same Claude turn (e.g. Stop + Notification at the end of a plan phase) now produce exactly one notification.
-- **No more stale in-window toasts.** After firing the OS banner, `hook.js` marks the signal as `fired`. The extension ignores fired signals when you return to VS Code, so you never see a duplicate toast for a banner you already saw.
-- **Event priority.** When `waiting` (user action required) and `completed` (just-finished) fire together, the more urgent `waiting` notification wins.
-- **Click-to-focus is silent.** Clicking an OS banner now jumps you to the matching terminal without an extra in-window toast.
-- **Fixed volume scale.** The `0–100` slider now maps linearly to the audio amplitude (`0.0–1.0`) instead of being interpreted as a `0–255` gain. Default `50` matches typical OS-notification loudness at your current system volume; `100` plays the file at its native level.
-- **Smarter macOS setup.** The **Configure** action detects whether `terminal-notifier` is already installed and offers the right next step (install, reinstall, test banner, or open System Settings) instead of always prompting to install.
+- **Stage-ID dedup replaces the 5-second session timer.** Each Claude session now tracks a `stageId` that advances on (a) a `UserPromptSubmit` (you sent a new message), (b) a different event type than the last notified one, or (c) the previous stage being acknowledged. Acknowledgment means clicking the OS banner, using **Focus Terminal**, or already having focus on the matching terminal. Same-event re-fires on an unresolved stage are suppressed at the source — no banner, no sound, no clipped audio. Removes the "ghost banner shows up minutes later for something I already dealt with" failure mode the old 5-second window couldn't catch.
+- **State moved out of `.vscode/`.** All coordination state (signal, click marker, claim marker, sessions) lives in `~/.claude/focus-state/<sha1(workspace).slice(0,12)>/`. It can never appear in your repo's `git status`, never confuse a teammate browsing `.vscode/`, and the **Add Signal Files to Global Gitignore** command is gone because it's no longer needed.
+- **New `UserPromptSubmit` hook.** Claude Code's `UserPromptSubmit` event now bumps the session's stageId so the next notification after you respond is always treated as a fresh stage.
+- **`npm test`.** `lib/state-paths.js` and `lib/stage-dedup.js` ship with `node:test` unit tests covering the stage-machine transitions.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ## How It Works
 
 ```
-Claude needs input / finishes task / requests permission
+Claude fires hook (Stop / Notification / PermissionRequest / UserPromptSubmit)
        │
        ▼
-Claude Code fires Stop, Notification, or PermissionRequest hook
+hook.js consults stage-dedup state for this session
        │
-       ▼
-hook.js writes a signal file, sleeps 1.2s, then races the extension
+       ├─ Re-fire of an already-notified, unresolved stage → exit silently
        │
-       ├── Extension wins the claim (VS Code is focused):
-       │     ├─ Already on the correct terminal → sound only (configurable)
-       │     └─ Different terminal / tab        → sound + in-window toast
-       │
-       └── Hook wins the claim (VS Code not focused / closed):
-             └─ OS banner + sound; clicking it focuses the terminal
+       └─ Fresh stage (new event type, resolved, or first event):
+             │
+             ▼
+       Write signal file → sleep 1.2 s → race the extension
+             │
+             ├── Extension wins the claim (VS Code is focused):
+             │     ├─ Already on the correct terminal → sound only (and ack)
+             │     └─ Different terminal / tab        → sound + in-window toast
+             │
+             └── Hook wins the claim (VS Code not focused / closed):
+                   └─ OS banner + sound; clicking it focuses the terminal (and ack)
 ```
 
-**Key design.** Exactly one notification path fires per event — never zero, never two. Both sides claim the same marker file atomically via `O_EXCL`, so the winner is unambiguous even under rapid concurrent events.
+**Key design.** Exactly one notification path fires per stage — never zero, never two for the same stage. Both sides claim the same marker file atomically via `O_EXCL`, so the winner is unambiguous even under rapid concurrent events. A stage advances only when you've engaged (clicked, focused, responded) or Claude moves to a genuinely new state — so re-fires of the same event minutes later are silently dropped.
 
 ## Focus Behavior
 
@@ -130,7 +132,6 @@ Open the command palette (`Ctrl/Cmd+Shift+P`) and search for:
 |---|---|
 | **Set Up Claude Code Hooks** | Install hooks in `~/.claude/settings.json`. |
 | **Remove Claude Code Hooks** | Remove hooks (leaves any other settings untouched). |
-| **Add Signal Files to Global Gitignore** | Prevent signal files from showing up in `git status`. |
 | **Test Notification** | Send a test notification to verify your setup end-to-end. |
 | **Toggle Mute** | Mute/unmute notifications (also available via the status bar). |
 | **Choose Sound** | Browse bundled, system, and custom sounds per event. |
@@ -145,6 +146,7 @@ The extension listens to three Claude Code hook events, grouped into two types:
 |---|---|---|---|
 | **Waiting** | `Notification`, `PermissionRequest` | "Waiting for your response in: *{project}*" | `notification.wav` |
 | **Completed** | `Stop` | "Task completed in: *{project}*" | `task-complete.wav` |
+| *(stage advance)* | `UserPromptSubmit` | — (no banner; bumps stageId so the next event re-notifies) | — |
 
 ## macOS Setup
 
@@ -176,7 +178,8 @@ If you previously used the shell-script setup:
 | No sound | Check that `waiting.action` / `completed.action` aren't set to `Notification only` or `Nothing`, and that `volume` is > 0. |
 | Sound is too loud or too quiet | Adjust `volume`. `50` matches typical OS-notification loudness; `100` plays the file at its native level. OS master volume still applies. |
 | Notification doesn't open VS Code | macOS: run **"Configure macOS terminal-notifier"**. Windows: click-to-open uses `vscode://` — no setup needed. |
-| Duplicate notifications | Update to v3.1+. If still duplicating, make sure the legacy `dimokol.claude-terminal-focus` extension is uninstalled. |
+| Duplicate notifications | Update to v3.2+. The new stage-ID dedup suppresses re-fires of the same event until you acknowledge — see [How It Works](#how-it-works). If still duplicating, make sure the legacy `dimokol.claude-terminal-focus` extension is uninstalled. |
+| Notifications stop firing | Inspect `~/.claude/focus-state/<hash>/sessions` (where `<hash>` is the 12-char hash for your workspace). If you see `resolved:true` stuck for the active session, that's the dedup remembering you acknowledged a stage. Delete the file to reset; the next event will create a fresh stage. |
 | Two `terminal-notifier` entries in macOS Notifications | macOS keeps notification settings per bundle, and a past install (e.g. bundled with `node-notifier` or an older brew version) can linger. Configure the entry you want and leave the other off. To fully reset: `killall NotificationCenter` then fire any notification once to re-register. |
 | Wrong terminal focused | Check the **"Claude Notifications"** Output panel for PID matching logs. |
 | Hooks not firing | Run **"Set Up Claude Code Hooks"** and restart any active Claude Code sessions so they re-read `~/.claude/settings.json`. |
@@ -184,17 +187,32 @@ If you previously used the shell-script setup:
 
 ## How the Hook Works
 
-The extension ships a bundled `dist/hook.js` that Claude Code runs when it needs your attention. The script:
+The extension ships two bundled hooks that Claude Code invokes:
 
-1. Reads the project directory from the `CLAUDE_PROJECT_DIR` environment variable.
-2. Walks up looking for a `.vscode/` folder to find the VS Code workspace root.
-3. Builds a PID ancestor chain so the extension can focus the exact terminal tab that spawned Claude.
-4. Writes a JSON signal file to `<workspace>/.vscode/.claude-focus`.
-5. Sleeps 1.2 seconds to give the extension time to claim the signal if VS Code is focused.
-6. Atomically tries to claim the handled-marker. If the extension already claimed it, exits silently.
-7. Otherwise marks the signal as `fired`, plays the configured sound, and shows an OS banner.
+- `dist/hook.js` — runs on `Stop`, `Notification`, and `PermissionRequest`. Decides whether to notify, writes the signal, and races the extension for the claim.
+- `dist/hook-user-prompt.js` — runs on `UserPromptSubmit`. Tiny: it just advances the session's `stageId` so the next Stop/Notification is treated as a fresh stage.
 
-`hook.js` and the extension are both bundled with esbuild, so the installed package has no runtime `node_modules` dependency — just two self-contained JS files per platform.
+`hook.js` flow:
+
+1. Reads `session_id`, `hook_event_name`, and `message` from stdin (Claude's hook input).
+2. Reads the project directory from `CLAUDE_PROJECT_DIR` and walks up looking for a `.vscode/` folder to identify the VS Code workspace root.
+3. Hashes that workspace root (`sha1` → 12 hex chars) to derive `~/.claude/focus-state/<hash>/`.
+4. Calls `shouldNotify(workspaceRoot, sessionId, event)` — if the current stage was already notified for this event type and not yet acknowledged, exits immediately.
+5. Builds a PID ancestor chain so the extension can focus the exact terminal tab that spawned Claude.
+6. Writes a JSON signal file to `~/.claude/focus-state/<hash>/signal`.
+7. Sleeps 1.2 seconds to give the extension time to claim if VS Code is focused.
+8. Atomically tries to claim the handled-marker (`O_EXCL`). If the extension or a sibling hook already claimed it, exits silently.
+9. Otherwise marks the signal `fired`, plays the configured sound, and shows an OS banner.
+
+A stage is marked **resolved** when:
+
+- You click an OS banner (`terminal-notifier -execute` writes a clicked marker; the extension picks it up and marks resolved).
+- You click **Focus Terminal** on an in-window toast.
+- The notification fires while you're already focused on the matching terminal (sound-only path).
+
+After `markResolved`, the next event of any type — even the same type — advances the stageId and notifies again.
+
+`hook.js`, `hook-user-prompt.js`, and the extension are all bundled with esbuild, so the installed package has no runtime `node_modules` dependency — just self-contained JS files.
 
 ## License
 
