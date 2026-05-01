@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.2.1] - 2026-05-01
+
+### Fixed
+- **Duplicate banner when `Stop` is followed by `Notification("waiting for your input")`.** Claude Code commonly emits both events seconds apart for the same logical attention point. v3.2.0's stage-ID dedup treated the event-type change as a new stage and fired a second banner — frequently after the user had already glanced at the terminal for the first one and stepped away. `lib/stage-dedup.js` no longer treats event-type change as a stage boundary; only user-prompt or explicit ack advances the stage. The legitimate "permission interrupts a wait" case is unaffected because both hook events normalize to the same `waiting` bucket in `hook.js`.
+
+### Changed
+- **`extensionDependencies` → `extensionPack`** for `anthropic.claude-code`. Same install-time pull-in, but Claude Code can now be uninstalled without breaking this extension and a future rename/unpublish of the upstream ID can no longer brick installs of this one.
+- **README leads with two GIFs** (OS-banner-to-terminal and in-VS-Code-toast-to-terminal) so the Marketplace listing shows the actual behavior above the fold.
+- **Added `hooks` keyword** to package.json for Marketplace search.
+
 ## [3.2.0] - 2026-04-25
 
 ### Changed

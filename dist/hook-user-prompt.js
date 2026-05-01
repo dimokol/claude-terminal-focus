@@ -93,8 +93,7 @@ var require_stage_dedup = __commonJS({
         writeSessions(workspaceRoot, map);
         return { notify: true, stageId: entry.stageId };
       }
-      const shouldAdvance = entry.resolved === true || entry.lastEvent !== currentEvent;
-      if (shouldAdvance) {
+      if (entry.resolved === true) {
         entry.stageId = (entry.stageId || 0) + 1;
         entry.lastEvent = currentEvent;
         entry.resolved = false;
@@ -103,6 +102,9 @@ var require_stage_dedup = __commonJS({
         writeSessions(workspaceRoot, map);
         return { notify: true, stageId: entry.stageId };
       }
+      entry.lastEvent = currentEvent;
+      entry.updatedAt = now;
+      writeSessions(workspaceRoot, map);
       return { notify: false, stageId: entry.stageId };
     }
     function advanceOnPrompt2(workspaceRoot, sessionId) {

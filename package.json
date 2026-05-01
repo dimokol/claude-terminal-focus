@@ -2,7 +2,7 @@
   "name": "claude-notifications",
   "displayName": "Claude Notifications",
   "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
@@ -32,6 +32,7 @@
     "focus",
     "notification",
     "notifications",
+    "hooks",
     "anthropic",
     "ai",
     "productivity",
@@ -46,7 +47,7 @@
     "desktop-notification",
     "audio"
   ],
-  "extensionDependencies": [
+  "extensionPack": [
     "anthropic.claude-code"
   ],
   "activationEvents": [

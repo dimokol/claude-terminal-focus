@@ -2,6 +2,10 @@
 
 **All-in-one Claude Code notification system — sound alerts, OS banners, and terminal focus. Zero-interaction setup, fully customizable.**
 
+![OS notification → terminal focus](images/os-notification.gif)
+
+![In-VS-Code toast → terminal focus](images/vsc-banner.gif)
+
 When running multiple Claude Code sessions across different VS Code windows and terminals:
 
 1. **Hear a sound** when Claude finishes a task or needs your input.
@@ -21,9 +25,10 @@ Works on **macOS**, **Windows**, and **Linux**, across multiple VS Code windows 
 
 ## What's New in v3.2
 
-- **Stage-ID dedup replaces the 5-second session timer.** Each Claude session now tracks a `stageId` that advances on (a) a `UserPromptSubmit` (you sent a new message), (b) a different event type than the last notified one, or (c) the previous stage being acknowledged. Acknowledgment means clicking the OS banner, using **Focus Terminal**, or already having focus on the matching terminal. Same-event re-fires on an unresolved stage are suppressed at the source — no banner, no sound, no clipped audio. Removes the "ghost banner shows up minutes later for something I already dealt with" failure mode the old 5-second window couldn't catch.
+- **v3.2.1 — fix duplicate banner on Stop→waiting.** Claude Code often emits `Stop("completed")` and then `Notification("waiting for your input")` a few seconds apart for the same logical attention point. v3.2.0 treated the event-type change as a new stage and fired a second banner (typically right after you'd already glanced at the terminal for the first). The dedup now ignores event-type change entirely — only a new prompt or an explicit ack advances the stage.
+- **Stage-ID dedup replaces the 5-second session timer.** Each Claude session tracks a `stageId` that advances on (a) a `UserPromptSubmit` (you sent a new message) or (b) the previous stage being acknowledged. Acknowledgment means clicking the OS banner, using **Focus Terminal**, or already having focus on the matching terminal. Re-fires on an unresolved stage are suppressed at the source — no banner, no sound, no clipped audio. Removes the "ghost banner shows up minutes later for something I already dealt with" failure mode the old 5-second window couldn't catch.
 - **State moved out of `.vscode/`.** All coordination state (signal, click marker, claim marker, sessions) lives in `~/.claude/focus-state/<sha1(workspace).slice(0,12)>/`. It can never appear in your repo's `git status`, never confuse a teammate browsing `.vscode/`, and the **Add Signal Files to Global Gitignore** command is gone because it's no longer needed.
-- **New `UserPromptSubmit` hook.** Claude Code's `UserPromptSubmit` event now bumps the session's stageId so the next notification after you respond is always treated as a fresh stage.
+- **New `UserPromptSubmit` hook.** Claude Code's `UserPromptSubmit` event bumps the session's stageId so the next notification after you respond is always treated as a fresh stage.
 - **`npm test`.** `lib/state-paths.js` and `lib/stage-dedup.js` ship with `node:test` unit tests covering the stage-machine transitions.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
@@ -38,7 +43,7 @@ hook.js consults stage-dedup state for this session
        │
        ├─ Re-fire of an already-notified, unresolved stage → exit silently
        │
-       └─ Fresh stage (new event type, resolved, or first event):
+       └─ Fresh stage (first event for the session, or previous stage acked):
              │
              ▼
        Write signal file → sleep 1.2 s → race the extension

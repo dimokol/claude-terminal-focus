@@ -21,4 +21,5 @@ esbuild.js
 **/.DS_Store
 package-lock.json
 images/icon.svg
+*.mov
 CLAUDE.md

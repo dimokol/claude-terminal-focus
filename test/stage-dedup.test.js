@@ -33,9 +33,23 @@ test('same event type on unresolved stage is suppressed', () => {
   assert.strictEqual(entry.stageId, 1, 'stage must not advance on suppression');
 });
 
-test('different event type advances stage and notifies', () => {
+test('different event type on unresolved stage is suppressed (Stop→waiting dedup)', () => {
+  // Claude Code often emits Stop("completed") immediately followed by
+  // Notification("waiting") for the same attention point. They must
+  // collapse to a single notification.
   const root = tmpWorkspace();
   shouldNotify(root, 'sess-a', 'completed');
+  const res = shouldNotify(root, 'sess-a', 'waiting');
+  assert.strictEqual(res.notify, false);
+  const entry = _readSessions(root)['sess-a'];
+  assert.strictEqual(entry.stageId, 1, 'stage must not advance across event-type change');
+  assert.strictEqual(entry.lastEvent, 'waiting', 'lastEvent should track the latest signal');
+});
+
+test('different event type after resolve advances stage and notifies', () => {
+  const root = tmpWorkspace();
+  shouldNotify(root, 'sess-a', 'completed');
+  markResolved(root, 'sess-a');
   const res = shouldNotify(root, 'sess-a', 'waiting');
   assert.strictEqual(res.notify, true);
   assert.strictEqual(res.stageId, 2);

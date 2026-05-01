@@ -141,7 +141,7 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 - [ ] **`git status` clean.** No staged or unstaged changes.
 - [ ] **`npm run build` clean.** No errors, no warnings.
 - [ ] **`npm test` green.** All `node:test` tests pass.
-- [ ] **`extensionDependencies`** in `package.json` actually resolve in the Marketplace. The current value `["anthropic.claude-code"]` forces the Claude Code VS Code extension to be installed alongside ours. If that ID disappears from the Marketplace, our extension becomes un-installable. **Verify by visiting** `https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code` before each publish. Remove the dependency if uncertain.
+- [ ] **`extensionPack`** in `package.json` actually resolves in the Marketplace. The current value `["anthropic.claude-code"]` bundles the Claude Code VS Code extension on install (soft — users can uninstall it without breaking ours, unlike `extensionDependencies`). If that ID disappears from the Marketplace, the *bundle* breaks but our extension still installs. **Verify by visiting** `https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code` before each publish. Remove the entry if uncertain.
 - [ ] **Dry-run the package**:
   ```bash
   vsce ls           # lists every file that will ship in the VSIX
@@ -153,6 +153,7 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
   - `*.vsix`, internal `*.md` files (only README.md, CHANGELOG.md, LICENSE)
   - `CLAUDE.md`
   - `images/icon.svg` (only the rendered PNG should ship)
+  - `*.mov` (raw screen recordings — only the converted GIFs in `images/` ship)
 
   `.vscodeignore` should handle this; verify with `vsce ls`.
 - [ ] **Bundles run cross-platform.** If a change touched `dist/hook.js` or `dist/hook-user-prompt.js`, run the hook manually on macOS at minimum (and Windows if accessible) before publish.
@@ -181,7 +182,7 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 - **Silent write failures.** `lib/stage-dedup.js#writeSessions` swallows errors. If `~/.claude/focus-state/` becomes unwritable, dedup silently degrades to "always notify". An optional `console.error` to stderr from hook.js (where it lands in Claude's hook log) would surface this. Not critical.
 - **No automated UI tests.** `extension.js` is exercised manually. The `vscode-test` harness is heavy and the manual checklist has been good enough so far.
 - **Workspace root heuristic.** `hook.js` walks up looking for a `.vscode/` directory. If the user runs Claude from a deeply nested subdirectory of a non-VS-Code repo, they get an isolated state dir per `claude` invocation. Acceptable.
-- **`extensionDependencies` is fragile.** See the bonus section at the bottom of this file and the publish checklist.
+- **`extensionPack` is softer than `extensionDependencies` was, but still tied to the upstream ID.** If `anthropic.claude-code` is renamed or unpublished, the install-time bundle breaks (our extension still installs fine). See the publish checklist.
 
 ---
 
