@@ -312,7 +312,7 @@ function xmlEsc(s) {
             } catch {
               (New-Object System.Media.SoundPlayer '${esc}').PlaySync()
             }`.trim();
-          execFile('powershell', ['-NoProfile', '-Command', psCmd], () => {});
+          execFile('powershell', ['-NoProfile', '-Command', psCmd], { windowsHide: true }, () => {});
         } else {
           const paVol = String(Math.round((volume / 100) * 65536));
           execFile('paplay', ['--volume', paVol, fileToPlay], (err) => {
@@ -394,15 +394,31 @@ function xmlEsc(s) {
     //      headroom to complete before the spawned PowerShell exits.
     //   4. Self-delete the temp file at the end of the script (own cleanup,
     //      no orphan files in %TEMP%).
-    const vscodePath = workspaceRoot.replace(/\\/g, '/');
-    const vscodeUri = `vscode://file/${vscodePath}`;
+    // Use our claude-notif:// URI handler instead of vscode://file/.
+    // Three reasons:
+    //   1. vscode://file/ triggers VS Code's
+    //      `security.promptForLocalFileProtocolHandling` dialog every time
+    //      (default true since 1.78) — "An external application wants to
+    //      open ..." — even when the workspace is already loaded.
+    //   2. vscode://file/<path> opens a NEW window for that path; it does
+    //      not switch to an existing window that already has the workspace.
+    //      Users with "empty VS Code + folders dragged in" multi-folder
+    //      setups never get focused into their actual session.
+    //   3. Our launcher writes the click marker before launching `code`,
+    //      so the extension's existing handleClickedSignal flow runs and
+    //      focuses the matching terminal — same UX as macOS.
+    const { buildLaunchUri } = require('./lib/win-protocol');
+    const launchUri = buildLaunchUri({
+      sessionId, pids, shellPid, workspaceRoot, projectDir,
+      event: hookEvent, project: projectName, aiTitle
+    });
     const tmpScript = path.join(os.tmpdir(), `claude-notif-${Date.now()}-${process.pid}.ps1`);
     const titleLine = aiTitle ? `    <text>${xmlEsc(aiTitle)}</text>` : '';
     const psScriptBody = `
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
 $template = @"
-<toast activationType="protocol" launch="${vscodeUri}" duration="long">
+<toast activationType="protocol" launch="${xmlEsc(launchUri)}" duration="long">
   <visual><binding template="ToastGeneric">
     <text>${xmlEsc(eventInfo.title)}</text>
 ${titleLine}
@@ -422,7 +438,9 @@ try {
 }
 `;
     try {
-      fs.writeFileSync(tmpScript, psScriptBody, 'utf8');
+      // BOM so Windows PowerShell 5.1 reads the .ps1 as UTF-8 instead of
+      // CP1252 — without it, the em-dash in titles becomes "â€"".
+      fs.writeFileSync(tmpScript, '﻿' + psScriptBody, 'utf8');
       const child = spawn('cmd.exe', [
         '/c', 'start', '""', '/B',
         'powershell.exe',

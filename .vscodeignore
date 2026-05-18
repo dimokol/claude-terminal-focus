@@ -9,6 +9,7 @@ node_modules/**
 extension.js
 hook.js
 hook-user-prompt.js
+bin/**
 lib/**
 esbuild.js
 *.vsix

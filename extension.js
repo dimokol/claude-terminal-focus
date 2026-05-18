@@ -47,6 +47,24 @@ function activate(context) {
   // --- Detect legacy extension (primary cause of duplicate toasts) ---
   warnIfLegacyExtensionActive(context, log);
 
+  // --- Windows: register claude-notif:// URI handler for OS-banner clicks ---
+  // Self-healing — every activation rewrites the HKCU keys with the current
+  // launcher and node paths, so reinstalls/updates don't leave orphans.
+  if (process.platform === 'win32') {
+    try {
+      const { installWinProtocol } = require('./lib/win-protocol');
+      const bundledLauncherPath = path.join(context.extensionPath, 'dist', 'win-click-handler.js');
+      const result = installWinProtocol({ bundledLauncherPath });
+      if (result.ok) {
+        log.appendLine(`Windows click-handler registered: launcher=${result.launcherPath} node=${result.nodeExe}`);
+      } else {
+        log.appendLine(`Windows click-handler registration failed (OS-banner click will fall back to no-op): ${result.error}`);
+      }
+    } catch (e) {
+      log.appendLine(`Windows click-handler registration threw: ${e.message}`);
+    }
+  }
+
   // --- Status bar ---
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   _statusBarItem = statusBarItem;
@@ -70,7 +88,8 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
     }),
     vscode.commands.registerCommand('claudeNotifications.chooseSound', (event) => cmdChooseSound(context, log, event)),
     vscode.commands.registerCommand('claudeNotifications.previewSound', () => cmdPreviewSound(context, log)),
-    vscode.commands.registerCommand('claudeNotifications.setupMacNotifier', () => cmdSetupMacNotifier(context, log))
+    vscode.commands.registerCommand('claudeNotifications.setupMacNotifier', () => cmdSetupMacNotifier(context, log)),
+    vscode.commands.registerCommand('claudeNotifications.uninstall', () => cmdUninstall(log))
   );
 
   // --- Signal file watcher (polling at 400ms) ---
@@ -627,6 +646,53 @@ async function promptMacNotifierSetup(context, log) {
   } else if (choice === "Don't Ask Again" || choice === 'Keep osascript') {
     await context.globalState.update('macNotifierPromptAnswered', true);
   }
+}
+
+async function cmdUninstall(log) {
+  const confirm = await vscode.window.showWarningMessage(
+    'Uninstall Claude Notifications: remove Claude Code hooks, click-handler registry key (Windows), and per-workspace state directories?',
+    { modal: true },
+    'Uninstall'
+  );
+  if (confirm !== 'Uninstall') return;
+
+  const { uninstallHooks } = require('./lib/hooks-installer');
+
+  try {
+    uninstallHooks();
+    log.appendLine('Uninstall: hooks removed');
+  } catch (e) {
+    log.appendLine(`Uninstall: hooks removal failed — ${e.message}`);
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const { uninstallWinProtocol, getLauncherDir } = require('./lib/win-protocol');
+      const r = uninstallWinProtocol();
+      log.appendLine(`Uninstall: registry key removed (${r.ok ? 'ok' : r.error})`);
+      try {
+        const dir = getLauncherDir();
+        fs.rmSync(dir, { recursive: true, force: true });
+        log.appendLine(`Uninstall: launcher dir removed (${dir})`);
+      } catch (e) {
+        log.appendLine(`Uninstall: launcher dir removal failed — ${e.message}`);
+      }
+    } catch (e) {
+      log.appendLine(`Uninstall: registry cleanup threw — ${e.message}`);
+    }
+  }
+
+  try {
+    const stateDir = path.join(os.homedir(), '.claude', 'focus-state');
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    log.appendLine(`Uninstall: state dir removed (${stateDir})`);
+  } catch (e) {
+    log.appendLine(`Uninstall: state dir removal failed — ${e.message}`);
+  }
+
+  vscode.window.showInformationMessage(
+    'Claude Notifications: cleanup complete. You can now safely uninstall the extension from the Extensions view.'
+  );
 }
 
 async function cmdSetupMacNotifier(context, log) {

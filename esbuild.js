@@ -28,9 +28,15 @@ Promise.all([
     entryPoints: ['./hook-user-prompt.js'],
     outfile: './dist/hook-user-prompt.js',
     minify: false
+  }),
+  esbuild.build({
+    ...common,
+    entryPoints: ['./bin/win-click-handler.js'],
+    outfile: './dist/win-click-handler.js',
+    minify: false
   })
 ]).then(() => {
-  console.log('Build complete: dist/extension.js, dist/hook.js, dist/hook-user-prompt.js');
+  console.log('Build complete: dist/extension.js, dist/hook.js, dist/hook-user-prompt.js, dist/win-click-handler.js');
 }).catch((err) => {
   console.error(err);
   process.exit(1);

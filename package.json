@@ -88,6 +88,10 @@
       {
         "command": "claudeNotifications.setupMacNotifier",
         "title": "Claude Notifications: Configure macOS terminal-notifier"
+      },
+      {
+        "command": "claudeNotifications.uninstall",
+        "title": "Claude Notifications: Uninstall (remove hooks, registry, state)"
       }
     ],
     "configuration": {

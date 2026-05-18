@@ -39,7 +39,11 @@ repo root
 │   ├── process-tree.js       # Cross-platform process snapshot + walkUp/walkDown. Replaces per-PID wmic/ps.
 │   ├── terminal-match.js     # Tiered terminal-matching (PID → cwd → Claude markers → non-default-name).
 │   ├── hooks-installer.js    # Read/write ~/.claude/settings.json hook entries.
+│   ├── win-protocol.js       # claude-notif:// URI scheme + HKCU registry CRUD (Windows-only side effects; pure helpers tested on macOS).
 │   └── sounds.js             # Cross-platform sound playback.
+│
+├── bin/
+│   └── win-click-handler.js  # Launcher invoked by Windows shell when the user clicks the OS toast. Bundled to dist/.
 │
 ├── test/                     # node:test unit tests for state-paths and stage-dedup. Run with `npm test`.
 ├── docs/
@@ -228,6 +232,7 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 | Duplicate banners | `~/.claude/focus-state/<hash>/sessions` — is `resolved` getting set on ack? Read `extension.js` ack paths. Re-check `stage-dedup.js#shouldNotify`. |
 | No banners at all | `~/.claude/settings.json` hook entries (`hooks.Stop[*].hooks[*].command` should point at `dist/hook.js`). Then check `hook.js` for early-exits (muted, event disabled, dedup suppressed). |
 | Wrong terminal focused | "Claude Notifications" Output channel. Look for `pids=[...]` and `Active terminal after switch`. The PID match logic is in `extension.js#focusMatchingTerminal`. |
+| Windows OS-banner click does nothing / opens unexpected window | `reg query "HKCU\Software\Classes\claude-notif\shell\open\command"` — does it exist and point at `%LOCALAPPDATA%\claude-notifications\win-click-handler.js`? Then check the "Claude Notifications" Output channel for `Windows click-handler registered:` at activation. If registration failed (e.g. node not on PATH at activation time), the OS-banner click reverts to no-op. The launcher is rewritten + the registry re-registered on every activation, so a VS Code reload usually self-heals. |
 | Wrong terminal after OS-banner click | Look for `Click-to-focus [marker]` vs `[signal-fallback]` in the log. `[marker]` should be the common path. `[signal-fallback]` means the click marker was empty/stale/corrupt — the per-workspace signal file is shared and may point at a sibling session. The marker payload itself is built in `hook.js` (terminal-notifier `-execute`) and parsed by `lib/click-marker.js`. |
 | "Already on correct terminal" duplicate sound | The auto-correct-terminal path in `extension.js` MUST NOT call `markResolved`. If it does, the next event in the same stage (Stop→Notification) will re-fire because `shouldNotify` sees `resolved=true` and bumps to a new stage. See v3.3.1 fix. |
 | Hook never fires | `~/.claude/settings.json` — was the hook installed? Did the user restart their `claude` session after install? |
