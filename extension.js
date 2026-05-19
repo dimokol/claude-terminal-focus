@@ -975,6 +975,11 @@ function syncSettingsToConfig(extensionPath, log) {
     completed: cfg.get('completed.action', 'Sound + Notification')
   };
 
+  // Windows-only: read by bin/win-click-handler.js (the OS toast launcher) at
+  // click time to decide between Win32 HWND focusing ("hwnd", default) and
+  // the legacy `code <workspace>` CLI routing ("cli"). See README.
+  config.windowsClickBehavior = cfg.get('windows.clickBehavior', 'hwnd');
+
   writeConfig(config);
   log.appendLine('Settings synced to shared config');
 }

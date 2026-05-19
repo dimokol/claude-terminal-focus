@@ -2,7 +2,7 @@
   "name": "claude-notifications",
   "displayName": "Claude Notifications",
   "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.",
-  "version": "3.5.1",
+  "version": "3.5.2",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
@@ -217,6 +217,24 @@
           "type": "null",
           "order": 100,
           "markdownDescription": "macOS only. [Configure terminal-notifier](command:claudeNotifications.setupMacNotifier) for click-to-open banners."
+        },
+        "claudeNotifications.windows.clickBehavior": {
+          "type": "string",
+          "enum": [
+            "hwnd",
+            "cli"
+          ],
+          "enumItemLabels": [
+            "Focus the exact VS Code window (default, multi-instance-safe)",
+            "Use the `code` CLI (legacy, may pick the wrong instance)"
+          ],
+          "enumDescriptions": [
+            "Identifies the specific VS Code instance that produced the notification via its process tree and focuses its window directly via Win32 SetForegroundWindow. Required when you have multiple VS Code windows open — the `code` CLI otherwise routes to whichever instance is most recently focused, not the one Claude is in.",
+            "Routes the click through the `code <workspace>` CLI. Always worked for single-instance setups; can land on the wrong window when multiple VS Code instances are open. Use this only if the default HWND path misbehaves on your machine."
+          ],
+          "default": "hwnd",
+          "order": 110,
+          "markdownDescription": "Windows only. How the OS-banner click resolves which VS Code window to focus. Falls back to the CLI path automatically if HWND focusing fails for any reason — this setting only forces the choice up front."
         }
       }
     }

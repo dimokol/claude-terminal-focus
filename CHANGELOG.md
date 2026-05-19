@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.5.2] - 2026-05-20
+
+### Fixed
+- **Windows: OS-banner click now focuses the EXACT VS Code instance that produced the notification, even when multiple VS Code windows are open.** Previously the click launcher invoked `code "<workspace>"`, which routes through VS Code's per-user CLI pipe and lands on whichever instance was most recently focused — not the one Claude was actually running in. With Instance B firing the banner and Instance A focused on a different monitor (or the same monitor, or a different desktop), Instance A would intercept the click and open the workspace itself, leaving the user staring at the wrong terminal panel. The launcher now: (1) reads the original Claude session's process-ancestor chain from the click marker; (2) walks up to find that instance's renderer `Code.exe` (`lib/code-instance-resolver.js`, deterministic per-instance — each VS Code window has its own renderer process tree); (3) shells out to PowerShell with inline Win32 P/Invoke (`EnumWindows` + `GetWindowThreadProcessId` + `SetForegroundWindow`) to focus that specific HWND. Multi-instance Windows now behaves identically to multi-instance macOS — clicks always land on the originating instance. Falls back to the legacy `code <workspace>` path automatically on any failure (process gone, no HWND found, P/Invoke error, PS timeout >3s), so the worst case is exactly 3.5.1's behaviour — never worse.
+
+### Added
+- `claudeNotifications.windows.clickBehavior` setting (default `"hwnd"`, alternative `"cli"`). Forces the click-routing strategy up front. Useful as an escape hatch if the HWND path misbehaves on a specific Windows build — flip to `"cli"` and you're identical to 3.5.1.
+- `lib/code-instance-resolver.js` — pure-JS PID-chain → renderer-Code.exe resolver. Supports Code stable, Code Insiders, VSCodium / Codium, Cursor, Windsurf. 12 `node:test` cases including a multi-instance regression fixture.
+
 ## [3.5.1] - 2026-05-19
 
 ### Fixed
