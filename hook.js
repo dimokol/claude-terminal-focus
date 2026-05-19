@@ -20,6 +20,7 @@ const path = require('path');
 const { execSync, execFile, spawn } = require('child_process');
 const os = require('os');
 const { setTimeout: sleep } = require('node:timers/promises');
+const { pathToFileURL } = require('node:url');
 const { claimHandled, eventPriority } = require('./lib/signals');
 const {
   getStateDir,
@@ -291,33 +292,53 @@ function xmlEsc(s) {
     const fileToPlay = soundPath || path.join(path.dirname(__filename), 'sounds', `${eventInfo.sound}.wav`);
 
     if (volume > 0 && fs.existsSync(fileToPlay)) {
+      // CRITICAL: every sound subprocess is launched detached + unref'd.
+      // execFile(..., callback) keeps the parent alive until the child
+      // closes its stdio, which on Windows meant PowerShell cold-start +
+      // WPF MediaPlayer + WAV duration kept Claude Code's Stop hook
+      // hanging for multiple seconds per message — and if PS hung at
+      // the (since-fixed) NaturalDuration polling loop, it hung forever.
+      // The hook MUST return control to Claude immediately; the sound
+      // plays in its own detached process.
       try {
         if (process.platform === 'darwin') {
           const vol = (volume / 100).toFixed(3);
-          execFile('afplay', ['-v', vol, fileToPlay], () => {});
+          const child = spawn('afplay', ['-v', vol, fileToPlay], {
+            detached: true, stdio: 'ignore'
+          });
+          child.unref();
         } else if (process.platform === 'win32') {
-          const esc = fileToPlay.replace(/'/g, "''");
+          const fileUri = pathToFileURL(fileToPlay);
           const vol = (volume / 100).toFixed(3);
           const psCmd = `
             try {
               Add-Type -AssemblyName PresentationCore -ErrorAction Stop
               $p = New-Object System.Windows.Media.MediaPlayer
-              $p.Open([System.Uri]::new('${esc}', [System.UriKind]::Absolute))
+              $p.Open([System.Uri]'${fileUri}')
               $p.Volume = ${vol}
-              while (-not $p.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 20 }
-              $ms = [int]$p.NaturalDuration.TimeSpan.TotalMilliseconds + 150
+              $deadline = (Get-Date).AddSeconds(3)
+              while (-not $p.NaturalDuration.HasTimeSpan -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 20
+              }
+              if ($p.NaturalDuration.HasTimeSpan) {
+                $ms = [int]$p.NaturalDuration.TimeSpan.TotalMilliseconds + 150
+              } else { $ms = 1500 }
               $p.Play()
               Start-Sleep -Milliseconds $ms
               $p.Close()
             } catch {
-              (New-Object System.Media.SoundPlayer '${esc}').PlaySync()
+              try { (New-Object System.Media.SoundPlayer '${fileToPlay.replace(/'/g, "''")}').PlaySync() } catch {}
             }`.trim();
-          execFile('powershell', ['-NoProfile', '-Command', psCmd], { windowsHide: true }, () => {});
+          const child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
+            detached: true, stdio: 'ignore', windowsHide: true
+          });
+          child.unref();
         } else {
           const paVol = String(Math.round((volume / 100) * 65536));
-          execFile('paplay', ['--volume', paVol, fileToPlay], (err) => {
-            if (err) execFile('aplay', [fileToPlay], () => {});
+          const child = spawn('sh', ['-c', `paplay --volume=${paVol} '${fileToPlay.replace(/'/g, "'\\''")}' || aplay '${fileToPlay.replace(/'/g, "'\\''")}'`], {
+            detached: true, stdio: 'ignore'
           });
+          child.unref();
         }
       } catch (_) {}
     }
@@ -465,4 +486,12 @@ try {
       child.unref();
     } catch (_) {}
   }
+
+  // CRITICAL: exit explicitly so Claude Code's hook handler returns
+  // immediately. All side-effect subprocesses above are spawned with
+  // detached + unref + stdio:'ignore', so they survive parent exit.
+  // Without this, Node would drain the event loop and any subprocess
+  // that's slow to release its handles (Windows PowerShell cold-start
+  // is the worst offender) would block Claude for seconds-to-minutes.
+  process.exit(0);
 })();
