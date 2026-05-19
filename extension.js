@@ -28,6 +28,16 @@ const { markResolved } = require('./lib/stage-dedup');
 const { parseClickMarker } = require('./lib/click-marker');
 const { matchTerminal } = require('./lib/terminal-match');
 const { checkHookStatus, checkAllProfiles, installHooks, uninstallHooks } = require('./lib/hooks-installer');
+const { installHookRuntime, uninstallHookRuntime, getWrapperHookPath, getWrapperUserPromptPath } = require('./lib/hook-runtime');
+
+let _wrapperPaths = null;
+function getWrapperPaths() {
+  // Even if installHookRuntime hasn't run (e.g. it failed), return the
+  // expected paths so callers don't crash. The wrapper just won't exist
+  // on disk in that degraded case.
+  if (_wrapperPaths) return _wrapperPaths;
+  return { hookPath: getWrapperHookPath(), userPromptHookPath: getWrapperUserPromptPath() };
+}
 const { playSound, playSoundFile, resolveSoundPath, discoverSystemSounds } = require('./lib/sounds');
 
 const POLL_MS = 400;
@@ -46,6 +56,28 @@ function activate(context) {
 
   // --- Detect legacy extension (primary cause of duplicate toasts) ---
   warnIfLegacyExtensionActive(context, log);
+
+  // --- Install / refresh the stable-location hook wrapper ---
+  // Hook entries in settings.json point at this wrapper rather than at
+  // the extension's dist/, so the hook contract survives uninstalls and
+  // upgrades. The wrapper self-destructs on its first fire after the
+  // extension is gone, cleaning every profile + Windows registry + state.
+  try {
+    const runtimeResult = installHookRuntime(context.extensionPath, {
+      extensionVersion: context.extension.packageJSON.version
+    });
+    if (runtimeResult.ok) {
+      _wrapperPaths = {
+        hookPath: runtimeResult.wrapperHookPath,
+        userPromptHookPath: runtimeResult.wrapperUserPromptPath
+      };
+      log.appendLine(`Hook runtime ready: ${runtimeResult.wrapperDir}`);
+    } else {
+      log.appendLine(`Hook runtime install failed (extension may produce stale hooks after uninstall): ${runtimeResult.error}`);
+    }
+  } catch (e) {
+    log.appendLine(`Hook runtime install threw: ${e.message}`);
+  }
 
   // --- Windows: register claude-notif:// URI handler for OS-banner clicks ---
   // Self-healing — every activation rewrites the HKCU keys with the current
@@ -506,7 +538,7 @@ function writeConfig(config) {
 }
 
 function updateStatusBar(item, extensionPath) {
-  const { status } = checkHookStatus(extensionPath);
+  const { status } = checkHookStatus(getWrapperPaths().hookPath);
 
   if (status === 'not-installed' || status === 'no-file') {
     item.text = '$(gear) Claude: Set Up';
@@ -529,7 +561,8 @@ function updateStatusBar(item, extensionPath) {
 // --- Commands ---
 
 async function cmdSetupHooks(context, log) {
-  const { status } = checkHookStatus(context.extensionPath);
+  const wrapper = getWrapperPaths();
+  const { status } = checkHookStatus(wrapper.hookPath);
 
   if (status === 'installed') {
     vscode.window.showInformationMessage('Claude Notifications hooks are already installed.');
@@ -552,7 +585,7 @@ async function cmdSetupHooks(context, log) {
     if (choice !== 'Install') return;
   }
 
-  const result = installHooks(context.extensionPath, { replaceLegacy });
+  const result = installHooks(wrapper, { replaceLegacy });
 
   if (result.success) {
     log.appendLine(`Hooks installed. Backup: ${result.backupPath}`);
@@ -663,6 +696,13 @@ async function cmdUninstall(log) {
     log.appendLine('Uninstall: hooks removed');
   } catch (e) {
     log.appendLine(`Uninstall: hooks removal failed — ${e.message}`);
+  }
+
+  try {
+    const r = uninstallHookRuntime();
+    log.appendLine(`Uninstall: hook runtime dir removed (${r.ok ? 'ok' : r.error})`);
+  } catch (e) {
+    log.appendLine(`Uninstall: hook runtime removal threw — ${e.message}`);
   }
 
   if (process.platform === 'win32') {
@@ -792,7 +832,8 @@ async function autoFixAllProfiles(context, log) {
   const config = vscode.workspace.getConfiguration('claudeNotifications');
   const autoSetup = config.get('autoSetupHooks', true);
 
-  const results = checkAllProfiles(context.extensionPath);
+  const wrapper = getWrapperPaths();
+  const results = checkAllProfiles(wrapper.hookPath);
   const needsFix = results.filter(r => r.status === 'stale-path' || r.status === 'partial');
 
   if (needsFix.length === 0) return;
@@ -802,7 +843,7 @@ async function autoFixAllProfiles(context, log) {
   for (const profile of needsFix) {
     log.appendLine(`Profile needs fix: ${profile.path} (status=${profile.status}, installed=${profile.installedPath || 'n/a'})`);
     if (!autoSetup) continue;
-    const result = installHooks(context.extensionPath, { settingsPath: profile.path });
+    const result = installHooks(wrapper, { settingsPath: profile.path });
     if (result.success) {
       fixed.push(profile.path);
     } else {
@@ -839,7 +880,8 @@ async function autoFixAllProfiles(context, log) {
 //   false           — prompt before any modification of ~/.claude/settings.json.
 
 async function runFirstRunChecks(context, log, statusBarItem) {
-  const { status } = checkHookStatus(context.extensionPath);
+  const wrapper = getWrapperPaths();
+  const { status } = checkHookStatus(wrapper.hookPath);
   log.appendLine(`Hook status: ${status}`);
 
   if (status === 'installed' || status === 'stale-path') return;
@@ -859,7 +901,7 @@ async function runFirstRunChecks(context, log, statusBarItem) {
         return;
       }
     }
-    const result = installHooks(context.extensionPath, {});
+    const result = installHooks(wrapper, {});
     if (result.success) {
       log.appendLine('Hooks installed on first run');
       vscode.window.showInformationMessage(
@@ -876,7 +918,7 @@ async function runFirstRunChecks(context, log, statusBarItem) {
   if (status === 'legacy') {
     if (autoSetup) {
       // Auto-upgrade silently with a confirmation toast.
-      const result = installHooks(context.extensionPath, { replaceLegacy: true });
+      const result = installHooks(wrapper, { replaceLegacy: true });
       if (result.success) {
         log.appendLine('Legacy shell-script hooks auto-upgraded to Node.js hooks');
         vscode.window.showInformationMessage(

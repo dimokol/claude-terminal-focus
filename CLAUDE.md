@@ -2,7 +2,7 @@
 
 > Project: **Claude Notifications** — VS Code extension (publisher `dimokol`, id `dimokol.claude-notifications`).
 > Repo name on disk: `claude-terminal-focus` (legacy directory name; do not rename, the publisher id is what users see).
-> Current version: **3.4.0**.
+> Current version: **3.5.0**.
 > User: solo maintainer, dev machine is macOS, target users are Claude Code users on macOS / Windows / Linux.
 
 This file is the entry point for any Claude / AI coding agent working in this repo. Read it before touching code or doing release work.
@@ -38,11 +38,13 @@ repo root
 │   ├── click-marker.js       # Parse/build the JSON payload terminal-notifier writes on click.
 │   ├── process-tree.js       # Cross-platform process snapshot + walkUp/walkDown. Replaces per-PID wmic/ps.
 │   ├── terminal-match.js     # Tiered terminal-matching (PID → cwd → Claude markers → non-default-name).
-│   ├── hooks-installer.js    # Read/write ~/.claude/settings.json hook entries.
+│   ├── hooks-installer.js    # Read/write ~/.claude/settings.json hook entries. As of 3.5.0 entries point at the wrapper (see bin/hook-wrapper.cjs), not at the extension's dist/.
+│   ├── hook-runtime.js       # installHookRuntime / uninstallHookRuntime — manages the stable-location wrapper dir at ~/.claude/claude-notifications/.
 │   ├── win-protocol.js       # claude-notif:// URI scheme + HKCU registry CRUD (Windows-only side effects; pure helpers tested on macOS).
 │   └── sounds.js             # Cross-platform sound playback.
 │
 ├── bin/
+│   ├── hook-wrapper.cjs      # Stable-location wrapper invoked by Claude Code's hook subsystem. Detects extension-uninstalled and self-destructs. Bundled to dist/.
 │   └── win-click-handler.js  # Launcher invoked by Windows shell when the user clicks the OS toast. Bundled to dist/.
 │
 ├── test/                     # node:test unit tests for state-paths and stage-dedup. Run with `npm test`.
@@ -235,7 +237,8 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 | Windows OS-banner click does nothing / opens unexpected window | `reg query "HKCU\Software\Classes\claude-notif\shell\open\command"` — does it exist and point at `%LOCALAPPDATA%\claude-notifications\win-click-handler.js`? Then check the "Claude Notifications" Output channel for `Windows click-handler registered:` at activation. If registration failed (e.g. node not on PATH at activation time), the OS-banner click reverts to no-op. The launcher is rewritten + the registry re-registered on every activation, so a VS Code reload usually self-heals. |
 | Wrong terminal after OS-banner click | Look for `Click-to-focus [marker]` vs `[signal-fallback]` in the log. `[marker]` should be the common path. `[signal-fallback]` means the click marker was empty/stale/corrupt — the per-workspace signal file is shared and may point at a sibling session. The marker payload itself is built in `hook.js` (terminal-notifier `-execute`) and parsed by `lib/click-marker.js`. |
 | "Already on correct terminal" duplicate sound | The auto-correct-terminal path in `extension.js` MUST NOT call `markResolved`. If it does, the next event in the same stage (Stop→Notification) will re-fire because `shouldNotify` sees `resolved=true` and bumps to a new stage. See v3.3.1 fix. |
-| Hook never fires | `~/.claude/settings.json` — was the hook installed? Did the user restart their `claude` session after install? |
+| Hook never fires | `~/.claude/settings.json` — was the hook installed? Should point at `~/.claude/claude-notifications/hook.cjs` (wrapper), not at the extension dir directly. Did the user restart their `claude` session after install? |
+| `MODULE_NOT_FOUND` errors in Claude after uninstall | Should be impossible as of 3.5.0 — the wrapper self-destructs on first fire after extension removal. If it does happen, the wrapper itself was deleted before it could self-clean. Manual remedy: run the cleanup steps from `cmdUninstall` in `extension.js` (uninstallHooks + uninstallHookRuntime + uninstallWinProtocol + rm focus-state). |
 | Build error | `node esbuild.js` output. Most often a require pointing at a deleted file — grep the `lib/` tree. |
 | Marketplace install error | `extensionDependencies` resolution. See publish checklist. |
 

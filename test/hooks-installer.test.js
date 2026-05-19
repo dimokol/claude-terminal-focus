@@ -74,36 +74,67 @@ function buildSettings({ hookPath, includeUserPrompt = true }) {
   return { hooks };
 }
 
+// Realistic paths: as of 3.5.0 hook entries point at the wrapper, not
+// the extension dir. Pre-3.5.0 entries (legacy direct-to-extension) live
+// inside an extension dir named like `dimokol.claude-notifications-3.4.0`
+// and are detected via that substring so they get auto-migrated.
+const WRAPPER_HOOK = '/home/u/.claude/claude-notifications/hook.cjs';
+const WRAPPER_USER_PROMPT = '/home/u/.claude/claude-notifications/hook-user-prompt.cjs';
+const LEGACY_3_4 = '/home/u/.vscode/extensions/dimokol.claude-notifications-3.4.0/dist/hook.js';
+const LEGACY_3_3 = '/home/u/.vscode/extensions/dimokol.claude-notifications-3.3.2/dist/hook.js';
+
+function buildWrapperSettings({ includeUserPrompt = true } = {}) {
+  const entry = (c) => ({ matcher: '', hooks: [{ type: 'command', command: c }] });
+  const cmd = `node "${WRAPPER_HOOK}"`;
+  const userPromptCmd = `node "${WRAPPER_USER_PROMPT}"`;
+  const hooks = {
+    Stop: [entry(cmd)],
+    Notification: [entry(cmd)],
+    PermissionRequest: [entry(cmd)]
+  };
+  if (includeUserPrompt) hooks.UserPromptSubmit = [entry(userPromptCmd)];
+  return { hooks };
+}
+
+function buildLegacySettings(legacyExtHookPath, { includeUserPrompt = true } = {}) {
+  const upPath = legacyExtHookPath.replace('hook.js', 'hook-user-prompt.js');
+  const entry = (c) => ({ matcher: '', hooks: [{ type: 'command', command: c }] });
+  const hooks = {
+    Stop: [entry(`node "${legacyExtHookPath}"`)],
+    Notification: [entry(`node "${legacyExtHookPath}"`)],
+    PermissionRequest: [entry(`node "${legacyExtHookPath}"`)]
+  };
+  if (includeUserPrompt) hooks.UserPromptSubmit = [entry(`node "${upPath}"`)];
+  return { hooks };
+}
+
 test('checkAllProfiles returns one entry per discovered profile', () => {
   const home = makeTempHome();
-  const extPath = '/ext/3.2.1';
-  const goodPath = path.join(extPath, 'dist/hook.js');
-  writeSettings(path.join(home, '.claude/settings.json'), buildSettings({ hookPath: goodPath }));
-  writeSettings(path.join(home, '.claude-other/settings.json'), buildSettings({ hookPath: '/ext/3.1.4/dist/hook.js' }));
+  writeSettings(path.join(home, '.claude/settings.json'), buildWrapperSettings());
+  writeSettings(path.join(home, '.claude-other/settings.json'), buildLegacySettings(LEGACY_3_3));
 
-  const results = checkAllProfiles(extPath, home);
+  const results = checkAllProfiles(WRAPPER_HOOK, home);
   assert.strictEqual(results.length, 2);
 
   const def = results.find(r => r.path.endsWith('/.claude/settings.json'));
   const other = results.find(r => r.path.endsWith('/.claude-other/settings.json'));
   assert.strictEqual(def.status, 'installed');
+  // Legacy 3.3 entry → stale-path (still ours, but pointing somewhere else)
   assert.strictEqual(other.status, 'stale-path');
-  assert.strictEqual(other.installedPath, '/ext/3.1.4/dist/hook.js');
+  assert.strictEqual(other.installedPath, LEGACY_3_3);
 });
 
 test('checkAllProfiles flags profile missing UserPromptSubmit as partial', () => {
   const home = makeTempHome();
-  const extPath = '/ext/3.2.1';
-  const stalePath = '/ext/3.1.4/dist/hook.js';
   writeSettings(
     path.join(home, '.claude-andreas/settings.json'),
-    buildSettings({ hookPath: stalePath, includeUserPrompt: false })
+    buildLegacySettings(LEGACY_3_4, { includeUserPrompt: false })
   );
 
-  const results = checkAllProfiles(extPath, home);
+  const results = checkAllProfiles(WRAPPER_HOOK, home);
   assert.strictEqual(results.length, 1);
   assert.strictEqual(results[0].status, 'partial');
-  assert.strictEqual(results[0].installedPath, stalePath);
+  assert.strictEqual(results[0].installedPath, LEGACY_3_4);
 });
 
 test('checkAllProfiles ignores profiles without our hooks', () => {
@@ -111,7 +142,7 @@ test('checkAllProfiles ignores profiles without our hooks', () => {
   writeSettings(path.join(home, '.claude/settings.json'), {
     hooks: { Stop: [{ matcher: '', hooks: [{ type: 'command', command: 'echo unrelated' }] }] }
   });
-  const results = checkAllProfiles('/ext/3.2.1', home);
+  const results = checkAllProfiles(WRAPPER_HOOK, home);
   assert.strictEqual(results.length, 1);
   assert.strictEqual(results[0].status, 'not-installed');
 });

@@ -1,5 +1,23 @@
 # Changelog
 
+## [3.5.0] - 2026-05-19
+
+### Changed
+- **Hook contract: `settings.json` now points at a stable-location wrapper, not at the extension's `dist/` directory.** The wrapper lives at `~/.claude/claude-notifications/{hook.cjs,hook-user-prompt.cjs}` and reads a sibling `state.json` to find the current extension's real hook bundles. On every Claude hook fire, the wrapper checks whether the extension is still installed:
+  - **Yes** → it `require()`s the real bundle in-process (one fs.readFile + JSON.parse + require — under 10ms overhead). Behaviour identical to pre-3.5.0.
+  - **No** (extension uninstalled / dir deleted) → it self-destructs: strips its own hook entries from every discovered Claude profile (`~/.claude/settings.json` and every `~/.claude-*/settings.json`, skipping `.claude-backup*`), removes `~/.claude/focus-state/`, removes the Windows `claude-notif://` registry handler + `%LOCALAPPDATA%\claude-notifications\` if present, and removes its own directory. Exits with empty stdout so Claude Code sees a clean hook completion. The next message is fully silent — no `MODULE_NOT_FOUND` spam, no manual cleanup script.
+- **Auto-migration on upgrade.** First 3.5.0 activation detects pre-3.5.0 direct-to-extension hook entries (by matching `dimokol.claude-notifications` in the command string) and rewrites them to point at the wrapper. Stale hook entries from old extension dirs no longer accumulate across upgrades.
+- The existing **"Claude Notifications: Uninstall"** palette command now also removes the wrapper dir — and is now strictly optional rather than required for clean uninstall, because the wrapper handles cleanup on its own.
+
+### Added
+- `lib/hook-runtime.js` — `installHookRuntime(extensionPath)` / `uninstallHookRuntime()`. Manages the wrapper directory + `state.json`. Both injectable-fs for testing.
+- `bin/hook-wrapper.cjs` — the self-contained wrapper script bundled to `dist/hook-wrapper.cjs` and copied to the runtime dir on activation. Dependency-free (only `node:` builtins) so it runs without any install step.
+- `test/hook-wrapper.test.js` (9 cases) — wrapper self-destruct invariants on a temp-dir mock home: foreign hooks preserved, legacy direct-to-extension entries detected, malformed settings.json tolerated, idempotent.
+- `test/hook-runtime.test.js` (6 cases) — install/uninstall + idempotency of the runtime dir.
+
+### Why
+VS Code provides no uninstall hook — `deactivate()` fires on every window close too, so an extension cannot reliably tell unload from uninstall. Until 3.5.0 this meant hook entries in `~/.claude/settings.json` outlived the extension dir, causing `MODULE_NOT_FOUND` on every Claude message after uninstall (and a "running stop hook" stall in extreme cases). The wrapper inverts the ownership: `settings.json` references a path *we* control, and we know how to clean ourselves up the next time we fire and find the extension gone.
+
 ## [3.4.0] - 2026-05-19
 
 ### Fixed
