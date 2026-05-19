@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.5.1] - 2026-05-19
+
+### Fixed
+- **Windows: PowerShell console flashed before every notification under Git Bash.** The OS-banner toast was launched via `cmd.exe /c start "" /B powershell.exe -File <tmp>` — the cmd/start indirection was originally a workaround so PowerShell would survive being inside Claude Code's job object. But because `cmd.exe` itself was launched with `windowsHide: true` (no console), `start /B` had no parent console to attach to and the OS allocated a fresh console for PowerShell; `-WindowStyle Hidden` then hid it AFTER allocation, causing a visible flash. Under native PowerShell shells the chain happened to allocate the console invisibly, but Git Bash exposed it consistently. The job-escape workaround is no longer needed — 3.5.0's explicit `process.exit(0)` + detached + unref guarantees the child outlives the parent. The toast now spawns `powershell.exe` directly with Node's `windowsHide: true`, which passes `CREATE_NO_WINDOW` to `CreateProcess` so no console is ever allocated. No flash, no focus-steal.
+- **Windows: clicking the OS banner opened bogus untitled placeholder files instead of focusing the workspace.** The `claude-notif://` click launcher used `spawn('code', [workspaceRoot], { shell: true })`. With `shell: true` + args-as-array, Node joins args with literal spaces and *does not quote them*. A workspaceRoot like `D:\SilvWeb Studio\Projects\2026\SilvWeb Labs\labs.silvweb.studio` (5 spaces) became 6 bogus CLI args, and VS Code created untitled placeholder tabs with those names instead of focusing the workspace. The launcher now builds a single fully-quoted command string and passes it to `spawn`, so paths with spaces survive intact through cmd.exe.
+
+### Notes
+- Multi-desktop Windows behaviour (banner click on Desktop A activates a VS Code instance on Desktop B and switches you to B) is OS behaviour, not extension behaviour — Windows always brings the originating app's window to focus on the desktop it lives on. We can't override that.
+
 ## [3.5.0] - 2026-05-19
 
 ### Changed

@@ -40,8 +40,14 @@ function main() {
   }
 
   try {
-    // `code` is a .cmd shim on Windows, so spawn via shell.
-    const child = spawn('code', [payload.workspaceRoot], {
+    // `code` is a .cmd shim on Windows so we need shell:true to find it,
+    // BUT spawn(prog, [args], { shell: true }) joins args with literal
+    // spaces — no quoting — which mangles any workspaceRoot containing
+    // a space ("D:\SilvWeb Studio\silvweb.studio" → 3 bogus args, VS Code
+    // opens untitled placeholders for each, no folder gets focused).
+    // Build a single fully-quoted command string instead.
+    const quotedPath = '"' + payload.workspaceRoot.replace(/"/g, '\\"') + '"';
+    const child = spawn('code ' + quotedPath, {
       detached: true, stdio: 'ignore', shell: true, windowsHide: true
     });
     child.unref();

@@ -462,10 +462,20 @@ try {
       // BOM so Windows PowerShell 5.1 reads the .ps1 as UTF-8 instead of
       // CP1252 — without it, the em-dash in titles becomes "â€"".
       fs.writeFileSync(tmpScript, '﻿' + psScriptBody, 'utf8');
-      const child = spawn('cmd.exe', [
-        '/c', 'start', '""', '/B',
-        'powershell.exe',
-        '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+      // Spawn powershell directly (no cmd.exe /c start /B wrapper).
+      // The cmd/start indirection was originally needed to escape Claude
+      // Code's job object so PS survived the parent's exit — but now that
+      // the hook calls process.exit(0) immediately and the child is
+      // detached + unref'd, the parent is gone before any job teardown
+      // can affect the child. Crucially, spawning powershell directly
+      // with `windowsHide: true` passes CREATE_NO_WINDOW to CreateProcess,
+      // so no console is ever allocated — eliminating the brief PS console
+      // flash some users saw (especially under Git Bash, where the cmd/
+      // start path allocated a fresh console for PS because cmd itself
+      // had no console to attach to).
+      const child = spawn('powershell.exe', [
+        '-NoProfile', '-NonInteractive',
+        '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
         '-File', tmpScript
       ], {
         detached: true,

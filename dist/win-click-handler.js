@@ -234,7 +234,8 @@ function main() {
   } catch (_) {
   }
   try {
-    const child = spawn("code", [payload.workspaceRoot], {
+    const quotedPath = '"' + payload.workspaceRoot.replace(/"/g, '\\"') + '"';
+    const child = spawn("code " + quotedPath, {
       detached: true,
       stdio: "ignore",
       shell: true,
