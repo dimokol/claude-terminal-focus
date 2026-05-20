@@ -60,10 +60,58 @@ var require_stage_dedup = __commonJS({
     var { getStateDir: getStateDir2, getSessionsPath } = require_state_paths();
     var SESSIONS_PRUNE_MS = 60 * 60 * 1e3;
     var STAGE_ESCAPE_VALVE_MS = 3e3;
+    var LOCK_WAIT_MS = 1e3;
+    var LOCK_SLEEP_MS = 5;
+    var LOCK_STALE_MS = 2e3;
     function ensureDir(workspaceRoot) {
       const dir = getStateDir2(workspaceRoot);
       fs2.mkdirSync(dir, { recursive: true });
       return dir;
+    }
+    function sleepSync(ms) {
+      try {
+        const sab = new SharedArrayBuffer(4);
+        const view = new Int32Array(sab);
+        Atomics.wait(view, 0, 0, ms);
+      } catch (_) {
+        const until = Date.now() + ms;
+        while (Date.now() < until) {
+        }
+      }
+    }
+    function acquireLock(workspaceRoot) {
+      const dir = ensureDir(workspaceRoot);
+      const lockPath = path2.join(dir, "dedup.lock");
+      const deadline = Date.now() + LOCK_WAIT_MS;
+      while (Date.now() < deadline) {
+        try {
+          fs2.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+          return lockPath;
+        } catch (err) {
+          if (err.code !== "EEXIST") return null;
+        }
+        try {
+          const stat = fs2.statSync(lockPath);
+          if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+            try {
+              fs2.unlinkSync(lockPath);
+            } catch (_) {
+            }
+            continue;
+          }
+        } catch (_) {
+          continue;
+        }
+        sleepSync(LOCK_SLEEP_MS);
+      }
+      return null;
+    }
+    function releaseLock(lockPath) {
+      if (!lockPath) return;
+      try {
+        fs2.unlinkSync(lockPath);
+      } catch (_) {
+      }
     }
     function readSessions(workspaceRoot) {
       const p = getSessionsPath(workspaceRoot);
@@ -81,82 +129,109 @@ var require_stage_dedup = __commonJS({
         const u = map[key] && map[key].updatedAt;
         if (typeof u === "number" && now - u > SESSIONS_PRUNE_MS) delete map[key];
       }
+      const finalPath = getSessionsPath(workspaceRoot);
+      const tmpPath = finalPath + ".tmp." + process.pid + "." + now;
       try {
-        fs2.writeFileSync(getSessionsPath(workspaceRoot), JSON.stringify(map));
+        fs2.writeFileSync(tmpPath, JSON.stringify(map));
+        fs2.renameSync(tmpPath, finalPath);
       } catch (_) {
+        try {
+          fs2.unlinkSync(tmpPath);
+        } catch (_2) {
+        }
       }
     }
     function shouldNotify(workspaceRoot, sessionId, currentEvent) {
       if (!sessionId) return { notify: true, stageId: null };
-      const map = readSessions(workspaceRoot);
-      const now = Date.now();
-      let entry = map[sessionId];
-      if (!entry) {
-        entry = { stageId: 1, lastEvent: currentEvent, resolved: false, lastNotifiedAt: now, updatedAt: now };
-        map[sessionId] = entry;
-        writeSessions(workspaceRoot, map);
-        return { notify: true, stageId: 1 };
-      }
-      if (entry.lastEvent === null) {
+      const lock = acquireLock(workspaceRoot);
+      try {
+        const map = readSessions(workspaceRoot);
+        const now = Date.now();
+        let entry = map[sessionId];
+        if (!entry) {
+          entry = { stageId: 1, lastEvent: currentEvent, resolved: false, lastNotifiedAt: now, updatedAt: now };
+          map[sessionId] = entry;
+          writeSessions(workspaceRoot, map);
+          return { notify: true, stageId: 1 };
+        }
+        if (entry.lastEvent === null) {
+          entry.lastEvent = currentEvent;
+          entry.resolved = false;
+          entry.lastNotifiedAt = now;
+          entry.updatedAt = now;
+          writeSessions(workspaceRoot, map);
+          return { notify: true, stageId: entry.stageId };
+        }
+        if (entry.resolved === true) {
+          entry.stageId = (entry.stageId || 0) + 1;
+          entry.lastEvent = currentEvent;
+          entry.resolved = false;
+          entry.lastNotifiedAt = now;
+          entry.updatedAt = now;
+          writeSessions(workspaceRoot, map);
+          return { notify: true, stageId: entry.stageId };
+        }
+        const lastAt = entry.lastNotifiedAt || 0;
+        if (now - lastAt > STAGE_ESCAPE_VALVE_MS) {
+          entry.stageId = (entry.stageId || 0) + 1;
+          entry.lastEvent = currentEvent;
+          entry.resolved = false;
+          entry.lastNotifiedAt = now;
+          entry.updatedAt = now;
+          writeSessions(workspaceRoot, map);
+          return { notify: true, stageId: entry.stageId };
+        }
         entry.lastEvent = currentEvent;
-        entry.resolved = false;
-        entry.lastNotifiedAt = now;
         entry.updatedAt = now;
         writeSessions(workspaceRoot, map);
-        return { notify: true, stageId: entry.stageId };
+        return { notify: false, stageId: entry.stageId };
+      } finally {
+        releaseLock(lock);
       }
-      if (entry.resolved === true) {
-        entry.stageId = (entry.stageId || 0) + 1;
-        entry.lastEvent = currentEvent;
-        entry.resolved = false;
-        entry.lastNotifiedAt = now;
-        entry.updatedAt = now;
-        writeSessions(workspaceRoot, map);
-        return { notify: true, stageId: entry.stageId };
-      }
-      const lastAt = entry.lastNotifiedAt || 0;
-      if (now - lastAt > STAGE_ESCAPE_VALVE_MS) {
-        entry.stageId = (entry.stageId || 0) + 1;
-        entry.lastEvent = currentEvent;
-        entry.resolved = false;
-        entry.lastNotifiedAt = now;
-        entry.updatedAt = now;
-        writeSessions(workspaceRoot, map);
-        return { notify: true, stageId: entry.stageId };
-      }
-      entry.lastEvent = currentEvent;
-      entry.updatedAt = now;
-      writeSessions(workspaceRoot, map);
-      return { notify: false, stageId: entry.stageId };
     }
     function advanceOnPrompt2(workspaceRoot, sessionId) {
       if (!sessionId) return;
-      const map = readSessions(workspaceRoot);
-      const now = Date.now();
-      const entry = map[sessionId] || { stageId: 0, lastEvent: null, resolved: false, lastNotifiedAt: 0, updatedAt: now };
-      entry.stageId = (entry.stageId || 0) + 1;
-      entry.lastEvent = null;
-      entry.resolved = false;
-      entry.updatedAt = now;
-      map[sessionId] = entry;
-      writeSessions(workspaceRoot, map);
+      const lock = acquireLock(workspaceRoot);
+      try {
+        const map = readSessions(workspaceRoot);
+        const now = Date.now();
+        const entry = map[sessionId] || { stageId: 0, lastEvent: null, resolved: false, lastNotifiedAt: 0, updatedAt: now };
+        entry.stageId = (entry.stageId || 0) + 1;
+        entry.lastEvent = null;
+        entry.resolved = false;
+        entry.updatedAt = now;
+        map[sessionId] = entry;
+        writeSessions(workspaceRoot, map);
+      } finally {
+        releaseLock(lock);
+      }
     }
     function markResolved(workspaceRoot, sessionId) {
       if (!sessionId) return;
-      const map = readSessions(workspaceRoot);
-      const entry = map[sessionId];
-      if (!entry) return;
-      entry.resolved = true;
-      entry.updatedAt = Date.now();
-      writeSessions(workspaceRoot, map);
+      const lock = acquireLock(workspaceRoot);
+      try {
+        const map = readSessions(workspaceRoot);
+        const entry = map[sessionId];
+        if (!entry) return;
+        entry.resolved = true;
+        entry.updatedAt = Date.now();
+        writeSessions(workspaceRoot, map);
+      } finally {
+        releaseLock(lock);
+      }
     }
     module2.exports = {
       SESSIONS_PRUNE_MS,
       STAGE_ESCAPE_VALVE_MS,
+      LOCK_WAIT_MS,
+      LOCK_STALE_MS,
       shouldNotify,
       advanceOnPrompt: advanceOnPrompt2,
       markResolved,
-      _readSessions: readSessions
+      _readSessions: readSessions,
+      // Exposed for tests:
+      acquireLock,
+      releaseLock
     };
   }
 });

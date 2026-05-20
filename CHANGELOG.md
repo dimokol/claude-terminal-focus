@@ -1,5 +1,17 @@
 # Changelog
 
+## [3.5.3] - 2026-05-20
+
+### Fixed
+- **Duplicate notification on the FIRST event of a session.** Two concurrent races, each with a single-winner check in isolation, lined up to let both Stop and Notification hooks fire for the same logical "Claude finished" moment — most visible at session start where there's no prior state to dampen the race. Race #1 was a classic read-modify-write hole in `lib/stage-dedup.js#shouldNotify`: Claude Code fires Stop and Notification as separate hook processes ~100ms apart, both read `sessions.json` before either writes, both see "no entry", both decide `notify=true`. Race #2 was in `lib/signals.js#claimHandled`'s stale-recovery branch — the `stat → unlink → writeFileSync(wx)` sequence let two processes that both passed the staleness check both end up succeeding when their unlinks and writes interleaved just right. Fixed both:
+  - **`stage-dedup.js`** now wraps `shouldNotify`/`advanceOnPrompt`/`markResolved` in an O_EXCL lock-file critical section (`<state-dir>/dedup.lock`), serializing per-workspace dedup state mutations. Stale locks (>2s, indicating a process crash) get stolen automatically. Sessions writes are temp+rename atomic.
+  - **`signals.js`** restructures the stale-claim recovery so `unlink` itself is the contention point (POSIX guarantees exactly one unlinker on a given inode), then races the create under O_EXCL. Two single-winner steps, no interleaving window.
+- The **AskUserQuestion escape valve** (same-stage event after >3s triggers a fresh-stage notify) is fully preserved — explicit `escape-valve` test in the new concurrency suite verifies a 3.5s gap still fires.
+
+### Added
+- `test/stage-dedup-concurrency.test.js` (4 cases): 50 forked workers all calling `shouldNotify` on a brand-new session — asserts exactly 1 returns `notify=true`. Post-prompt burst, mixed Stop/Notification burst, escape-valve preservation.
+- `test/signals.test.js` claim tests (4 cases): single caller / fresh-marker rejection / stale-marker steal / 50-worker concurrent stale-steal — exactly 1 winner.
+
 ## [3.5.2] - 2026-05-20
 
 ### Fixed
