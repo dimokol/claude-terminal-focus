@@ -462,18 +462,28 @@ try {
       // BOM so Windows PowerShell 5.1 reads the .ps1 as UTF-8 instead of
       // CP1252 — without it, the em-dash in titles becomes "â€"".
       fs.writeFileSync(tmpScript, '﻿' + psScriptBody, 'utf8');
-      // Spawn powershell directly (no cmd.exe /c start /B wrapper).
-      // The cmd/start indirection was originally needed to escape Claude
-      // Code's job object so PS survived the parent's exit — but now that
-      // the hook calls process.exit(0) immediately and the child is
-      // detached + unref'd, the parent is gone before any job teardown
-      // can affect the child. Crucially, spawning powershell directly
-      // with `windowsHide: true` passes CREATE_NO_WINDOW to CreateProcess,
-      // so no console is ever allocated — eliminating the brief PS console
-      // flash some users saw (especially under Git Bash, where the cmd/
-      // start path allocated a fresh console for PS because cmd itself
-      // had no console to attach to).
-      const child = spawn('powershell.exe', [
+      // cmd.exe /c start "" /B powershell ... — the cmd/start indirection
+      // is what makes the toast actually fire. Direct spawn (3.5.1's
+      // attempt) leaves the powershell child inside Claude Code's hook
+      // job object on Windows. When Claude's hook subsystem closes its
+      // job handle right after our process.exit(0), the job's
+      // KILL_ON_JOB_CLOSE policy can tear down the still-cold PS process
+      // BEFORE it reaches WinRT's ToastNotificationManager.Show(). The
+      // hook's process.exit(0) doesn't help — job teardown isn't gated
+      // on the parent being alive, it's gated on the JOB HANDLE being
+      // closed. `start ""` detaches into a fresh process group that
+      // breaks away from the inherited job, so PS survives. Trade-off:
+      // under Git Bash + hidden cmd this re-introduces a brief PS console
+      // flash that 3.5.1 fixed, because `start /B` can't inherit the
+      // hidden cmd's (non-existent) console and the OS allocates a fresh
+      // one before -WindowStyle Hidden takes effect. Acceptable: a tiny
+      // flash beats notifications not firing at all. Long-term fix:
+      // Node 22.5+'s `windowsCreateProcessFlags: ['CREATE_BREAKAWAY_FROM_JOB']`
+      // would give a flash-free job break, but we can't require that
+      // until the user-installed Node baseline catches up.
+      const child = spawn('cmd.exe', [
+        '/c', 'start', '""', '/B',
+        'powershell.exe',
         '-NoProfile', '-NonInteractive',
         '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
         '-File', tmpScript

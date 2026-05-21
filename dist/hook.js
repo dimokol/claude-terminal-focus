@@ -1069,7 +1069,12 @@ try {
 `;
     try {
       fs.writeFileSync(tmpScript, "\uFEFF" + psScriptBody, "utf8");
-      const child = spawn("powershell.exe", [
+      const child = spawn("cmd.exe", [
+        "/c",
+        "start",
+        '""',
+        "/B",
+        "powershell.exe",
         "-NoProfile",
         "-NonInteractive",
         "-WindowStyle",

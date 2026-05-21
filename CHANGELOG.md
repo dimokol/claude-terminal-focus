@@ -1,5 +1,17 @@
 # Changelog
 
+## [3.5.4] - 2026-05-21
+
+### Fixed
+- **Windows: hook entries accumulated as duplicates with every VS Code restart.** A friend on Windows + Git Bash reported "no notifications at all" — diagnostic dump showed her `~/.claude/settings.json` had the same hook command registered **12 times** for every event type. Root cause: `lib/hooks-installer.js#getHookCommand` was building the command string via `` `node ${JSON.stringify(wrapperHookPath)}` ``. On POSIX paths (no backslashes) this round-trips fine, but on a Windows path like `C:\Users\Ada\.claude\claude-notifications\hook.cjs`, `JSON.stringify` produces a JS string with literal **double** backslashes (`C:\\Users\\...`). After settings.json round-trip the stored command in memory contained `claude-notifications\\hook.cjs` (two `\` characters), while `OUR_HOOK_IDENTIFIERS` checks for the substring `claude-notifications\hook.cjs` (one `\`). Two consequences cascaded:
+  1. `checkHookStatus` permanently returned `'not-installed'` after every install — the identifier match failed against the just-written command.
+  2. `installHooks`'s strip-before-push filter (line 200-208) found nothing to strip, so every activation appended a new entry to an already-installed array.
+  Effect: N VS Code launches → N hook entries → N hook processes spawned per Claude event (with the O_EXCL claim race deduping the actual notification, but each process still doing useless work and amplifying the existing Windows toast-survival race). Fix: replace `JSON.stringify(path)` with plain `"${path}"` quoting in both `getHookCommand` and `getUserPromptHookCommand`. macOS unaffected.
+- **Windows: OS-banner toast often never appeared after 3.5.1.** 3.5.1 removed the `cmd /c start "" /B powershell ...` wrapper that 3.5.0 used to launch the toast PowerShell, on the reasoning that `process.exit(0)` + `detached: true` + `unref()` would let the PS child survive Claude Code's hook process tearing down. That reasoning was incorrect: Windows job-object teardown isn't gated on the parent process being alive — it's gated on the **job handle** being closed. When Claude Code's hook subsystem closes its handle to the hook's job (immediately after the hook exits), `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` kills every process in the job, including our still-cold PowerShell that hasn't reached `ToastNotificationManager.Show()` yet. The empirical proof: the friend who reported 3.5.2 silently failed notifications on Git Bash *and* native PowerShell setups. The cmd/start wrapper detaches the eventual PS into a fresh process group that breaks away from the inherited job, so PS survives long enough to register the toast with the OS. Trade-off: under Git Bash this re-introduces the brief PS console flash 3.5.1 fixed — accepted as the lesser evil until we can require Node 22.5+ (`windowsCreateProcessFlags: ['CREATE_BREAKAWAY_FROM_JOB']` would give us a flash-free job break).
+
+### Added
+- `test/hooks-installer.test.js` regressions (3 cases): the install→checkHookStatus round-trip on a Windows-style path now passes; installHooks is provably idempotent across 12 sequential calls on both Windows and POSIX paths. These would have caught the double-backslash bug — pre-fix the round-trip case fails on `checkHookStatus` returning `'not-installed'`.
+
 ## [3.5.3] - 2026-05-20
 
 ### Fixed
