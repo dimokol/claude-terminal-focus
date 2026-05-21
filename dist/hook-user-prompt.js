@@ -163,6 +163,13 @@ var require_stage_dedup = __commonJS({
           return { notify: true, stageId: entry.stageId };
         }
         if (entry.resolved === true) {
+          const lastAt2 = entry.lastNotifiedAt || 0;
+          if (now - lastAt2 < STAGE_ESCAPE_VALVE_MS) {
+            entry.lastEvent = currentEvent;
+            entry.updatedAt = now;
+            writeSessions(workspaceRoot, map);
+            return { notify: false, stageId: entry.stageId };
+          }
           entry.stageId = (entry.stageId || 0) + 1;
           entry.lastEvent = currentEvent;
           entry.resolved = false;

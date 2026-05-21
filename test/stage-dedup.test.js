@@ -53,22 +53,57 @@ test('different event type on unresolved stage is suppressed (Stop→waiting ded
   assert.strictEqual(entry.lastEvent, 'waiting', 'lastEvent should track the latest signal');
 });
 
-test('different event type after resolve advances stage and notifies', () => {
+test('different event type after resolve advances stage and notifies (post-burst-window)', () => {
+  // Post v3.5.4 burst-after-ack guard: an ack inside the burst window
+  // suppresses the immediate follow-up. We backdate lastNotifiedAt so this
+  // test exercises the "ack happened long enough ago to be a real new
+  // attention point, not a platform burst" path.
   const root = tmpWorkspace();
   shouldNotify(root, 'sess-a', 'completed');
   markResolved(root, 'sess-a');
+  backdateLastNotified(root, 'sess-a', STAGE_ESCAPE_VALVE_MS + 100);
   const res = shouldNotify(root, 'sess-a', 'waiting');
   assert.strictEqual(res.notify, true);
   assert.strictEqual(res.stageId, 2);
 });
 
-test('resolved stage advances on next event even if same type', () => {
+test('resolved stage advances on next event even if same type (post-burst-window)', () => {
   const root = tmpWorkspace();
   shouldNotify(root, 'sess-a', 'completed');
   markResolved(root, 'sess-a');
+  backdateLastNotified(root, 'sess-a', STAGE_ESCAPE_VALVE_MS + 100);
   const res = shouldNotify(root, 'sess-a', 'completed');
   assert.strictEqual(res.notify, true);
   assert.strictEqual(res.stageId, 2);
+});
+
+test('burst-after-ack guard: resolve INSIDE burst window suppresses immediate follow-up', () => {
+  // Real-world scenario: AskUserQuestion fires PR + Notification ~1s apart.
+  // User clicks the OS banner after PR → markResolved fires before
+  // Notification arrives. Pre-fix, Notification hit the resolved=true
+  // branch and fired a duplicate sound. Fix: while still inside
+  // STAGE_ESCAPE_VALVE_MS of the last fired notification, treat the new
+  // event as part of the prior stage's platform burst and suppress.
+  const root = tmpWorkspace();
+  shouldNotify(root, 'sess-a', 'waiting');   // PR fires
+  markResolved(root, 'sess-a');              // user clicks banner
+  // No backdating — markResolved happened essentially now, well within
+  // the 3s burst window of the just-fired PR.
+  const res = shouldNotify(root, 'sess-a', 'waiting');  // Notification arrives
+  assert.strictEqual(res.notify, false, 'in-burst follow-up must be suppressed');
+  const entry = _readSessions(root)['sess-a'];
+  assert.strictEqual(entry.stageId, 1, 'stage must not advance — still the same attention point');
+  assert.strictEqual(entry.resolved, true, 'resolved must remain true; we did not advance');
+});
+
+test('burst-after-ack guard: same logic applies regardless of event type pair', () => {
+  // Stop→waiting and waiting→completed bursts are both platform pairs;
+  // the suppression must collapse either combination.
+  const root = tmpWorkspace();
+  shouldNotify(root, 'sess-a', 'completed'); // Stop
+  markResolved(root, 'sess-a');              // fast ack
+  const res = shouldNotify(root, 'sess-a', 'waiting'); // Notification arrives
+  assert.strictEqual(res.notify, false);
 });
 
 test('advanceOnPrompt bumps stageId and clears lastEvent without notifying', () => {
