@@ -3,7 +3,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { discoverProfiles, checkAllProfiles } = require('../lib/hooks-installer');
+const { discoverProfiles, checkAllProfiles, installHooks, checkHookStatus } = require('../lib/hooks-installer');
 
 function makeTempHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'claude-profiles-'));
@@ -145,4 +145,85 @@ test('checkAllProfiles ignores profiles without our hooks', () => {
   const results = checkAllProfiles(WRAPPER_HOOK, home);
   assert.strictEqual(results.length, 1);
   assert.strictEqual(results[0].status, 'not-installed');
+});
+
+// Regression: install → checkHookStatus round-trip on a Windows-style path.
+//
+// Pre-fix, getHookCommand used JSON.stringify(path) which double-escaped
+// backslashes in the in-memory command string. The stored command ended up
+// containing "claude-notifications\\hook.cjs" (literal `\\` sequence), while
+// OUR_HOOK_IDENTIFIERS uses "claude-notifications\hook.cjs" (single `\`).
+// commandReferencesAnyOf never matched → checkHookStatus permanently returned
+// 'not-installed' on Windows even after a successful install → every
+// activation re-ran installHooks → strip filter found nothing to remove →
+// one extra hook entry per VS Code start accumulated indefinitely. A user
+// with 12 VS Code restarts ended up with 12 duplicate hook entries per event.
+//
+// These tests would have caught it: installHooks then checkHookStatus must
+// report 'installed', and a second installHooks call must not duplicate.
+test('installHooks + checkHookStatus round-trip works on Windows-style paths (backslashes)', () => {
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+
+  const winWrapper = {
+    hookPath:           'C:\\Users\\Ada\\.claude\\claude-notifications\\hook.cjs',
+    userPromptHookPath: 'C:\\Users\\Ada\\.claude\\claude-notifications\\hook-user-prompt.cjs'
+  };
+
+  const installResult = installHooks(winWrapper, { settingsPath });
+  assert.strictEqual(installResult.success, true, installResult.message);
+
+  // The key invariant: after a successful install, the same paths must
+  // round-trip back through checkHookStatus as 'installed'.
+  const status = checkHookStatus(winWrapper.hookPath, settingsPath);
+  assert.strictEqual(status.status, 'installed',
+    `expected 'installed' after fresh install on Windows path, got '${status.status}' (installedPath=${status.installedPath})`);
+});
+
+test('installHooks is idempotent on Windows-style paths (no duplicate accumulation)', () => {
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+
+  const winWrapper = {
+    hookPath:           'C:\\Users\\Ada\\.claude\\claude-notifications\\hook.cjs',
+    userPromptHookPath: 'C:\\Users\\Ada\\.claude\\claude-notifications\\hook-user-prompt.cjs'
+  };
+
+  // Simulate 12 VS Code restarts hitting the install path.
+  for (let i = 0; i < 12; i++) {
+    const r = installHooks(winWrapper, { settingsPath });
+    assert.strictEqual(r.success, true, `install #${i + 1} failed: ${r.message}`);
+  }
+
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  for (const event of ['Stop', 'Notification', 'PermissionRequest', 'UserPromptSubmit']) {
+    assert.strictEqual(
+      Array.isArray(settings.hooks[event]) && settings.hooks[event].length,
+      1,
+      `expected exactly 1 entry for ${event} after 12 installs, got ${settings.hooks[event] && settings.hooks[event].length}`
+    );
+  }
+});
+
+test('installHooks is idempotent on POSIX paths (no duplicate accumulation)', () => {
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+
+  const posixWrapper = {
+    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+  };
+
+  for (let i = 0; i < 5; i++) {
+    const r = installHooks(posixWrapper, { settingsPath });
+    assert.strictEqual(r.success, true);
+  }
+
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  for (const event of ['Stop', 'Notification', 'PermissionRequest', 'UserPromptSubmit']) {
+    assert.strictEqual(settings.hooks[event].length, 1);
+  }
 });
