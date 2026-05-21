@@ -269,10 +269,25 @@ async function handleSignal(signalPath, workspaceRoot, log) {
       const desc = await describeTerminalForMatch(activeTerminal, activeIndex);
       const m = matchTerminal([desc], signal);
       if (m) {
-        log.appendLine(`Already on correct terminal — sound only (tier=${m.tier}, ${m.reason})`);
-        const soundWhenFocused = vscode.workspace.getConfiguration('claudeNotifications').get('soundWhenFocused', 'sound');
+        const cfg = vscode.workspace.getConfiguration('claudeNotifications');
+        const soundWhenFocused = cfg.get('soundWhenFocused', 'sound');
+        const toastWhenFocused = cfg.get('toastWhenFocused', false);
+        log.appendLine(`Already on correct terminal — sound=${soundWhenFocused === 'sound' && wantSound ? 'on' : 'off'} toast=${toastWhenFocused && wantToast ? 'on' : 'off'} (tier=${m.tier}, ${m.reason})`);
         if (soundWhenFocused === 'sound' && wantSound) {
           playEventSound(signal.event, config);
+        }
+        if (toastWhenFocused && wantToast) {
+          // Info-only toast. We deliberately do NOT include a "Focus
+          // Terminal" action — the matcher already confirmed they're on
+          // the right terminal, so the button would be a no-op. VS Code
+          // auto-dismisses info popups without actions after a few
+          // seconds. Same dedup invariant applies: do not call
+          // markResolved here either; this is not an explicit user ack.
+          const baseMsg = signal.event === 'completed'
+            ? `Task completed in: ${signal.project}`
+            : `Waiting for your response in: ${signal.project}`;
+          const msg = signal.aiTitle ? `${baseMsg} — ${signal.aiTitle}` : baseMsg;
+          vscode.window.showInformationMessage(msg);
         }
         return;
       }

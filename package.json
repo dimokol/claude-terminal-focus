@@ -203,15 +203,21 @@
           ],
           "enumItemLabels": [
             "Play sound",
-            "Stay silent"
+            "No sound"
           ],
           "enumDescriptions": [
-            "Play the configured audio cue even when you're already on the matching terminal.",
-            "No sound or toast when you're already on the matching terminal."
+            "Play the configured audio cue when you're already on the matching terminal.",
+            "Suppress the audio cue when you're already on the matching terminal."
           ],
           "default": "sound",
           "order": 90,
-          "description": "What to do when you're already on the terminal Claude just wrote to."
+          "description": "Audio behaviour when you're already on the terminal Claude just wrote to. (Visible toast is controlled separately by claudeNotifications.toastWhenFocused.)"
+        },
+        "claudeNotifications.toastWhenFocused": {
+          "type": "boolean",
+          "default": false,
+          "order": 91,
+          "description": "Show an in-window info toast when you're already on the matching terminal. Default off — the audio cue alone is usually enough since you're looking at the terminal. Enable for a visual cue alongside (or instead of) the sound, e.g. multi-monitor / small-terminal-panel setups, or accessibility."
         },
         "claudeNotifications.macOS.setup": {
           "type": "null",
