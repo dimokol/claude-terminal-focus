@@ -243,6 +243,105 @@ test('strict-pid: signal without shellPid → not applied (no claim of reliabili
   assert.strictEqual(m.tier, 'cwd');
 });
 
+// ai-title tier (v3.5.4) — Claude Code writes the session task name to the
+// terminal title. With multiple Claude sessions in one workspace, this is
+// often the ONLY unique discriminator (tier=pid may miss for shell-wrapped
+// or cross-window scenarios; tier=cwd matches every workspace terminal;
+// generic ✳ marker matches every Claude terminal). aiTitle, written by
+// Claude itself, is unique per session.
+
+test('ai-title tier: unique title substring picks the right Claude terminal', () => {
+  // Three terminals all in same workspace, all with ✳ marker (multi-Claude
+  // scenario). Without ai-title, tier=cwd and tier=claude-marker would both
+  // go ambiguous and fall through. ai-title picks the one matching signal.
+  const terminals = [
+    T(0, '✳ Address claude notifications open issues', 100, '/Users/u/proj'),
+    T(1, '✳ Investigate stray node processes', 200, '/Users/u/proj'),
+    T(2, 'zsh', 300, '/Users/u/proj')
+  ];
+  const signal = {
+    pids: [400, 1],                    // none of these match terminals
+    workspaceRoot: '/Users/u/proj',
+    project: 'proj',
+    aiTitle: 'Address claude notifications open issues'
+  };
+  const m = matchTerminal(terminals, signal);
+  assert.strictEqual(m.index, 0);
+  assert.strictEqual(m.tier, 'ai-title');
+});
+
+test('ai-title tier: ambiguous (two terminals share title substring) falls through', () => {
+  const terminals = [
+    T(0, '✳ Some Task', 100, '/Users/u/proj'),
+    T(1, '✳ Some Task', 200, '/Users/u/proj')
+  ];
+  const signal = {
+    pids: [1],
+    workspaceRoot: '/Users/u/proj',
+    project: 'proj',
+    aiTitle: 'Some Task'
+  };
+  const m = matchTerminal(terminals, signal);
+  // Two terminals with same title → ambiguous → falls through to
+  // claude-marker tier (both have ✳, also ambiguous) → falls through to
+  // non-default-name tier (both non-default, ambiguous) → null.
+  assert.strictEqual(m, null);
+});
+
+test('ai-title tier: short title (<4 chars) is ignored to avoid false positives', () => {
+  // Very short aiTitles could spuriously match unrelated terminal-name
+  // substrings. We require >=4 chars before honoring this tier.
+  const terminals = [
+    T(0, 'no.js helper terminal', 100, '/Users/u/proj'),
+    T(1, '✳ Real Claude session', 200, '/Users/u/proj')
+  ];
+  const signal = {
+    pids: [1],
+    workspaceRoot: '/Users/u/proj',
+    project: 'proj',
+    aiTitle: 'no'  // 2 chars — too short
+  };
+  const m = matchTerminal(terminals, signal);
+  // Should fall through to claude-marker (only [1] has ✳) → match [1]
+  assert.strictEqual(m.index, 1);
+  assert.strictEqual(m.tier, 'claude-marker');
+});
+
+test('ai-title tier: missing aiTitle falls through gracefully', () => {
+  // Two terminals so cwd is ambiguous; only one has ✳ marker so
+  // claude-marker tier resolves uniquely. Without aiTitle, ai-title
+  // tier is silently skipped.
+  const terminals = [
+    T(0, '✳ Foo', 100, '/Users/u/proj'),
+    T(1, 'zsh', 200, '/Users/u/proj')
+  ];
+  const signal = {
+    pids: [1],
+    workspaceRoot: '/Users/u/proj',
+    project: 'proj'
+    // no aiTitle
+  };
+  const m = matchTerminal(terminals, signal);
+  assert.strictEqual(m.tier, 'claude-marker');
+});
+
+test('ai-title tier: runs AFTER strict-PID escape (POSIX shellPid mismatch still nulls)', () => {
+  // Defensive: when POSIX strict-PID returns null because the firing
+  // session is definitively NOT in this window's terminals, we MUST
+  // continue to return null — even if aiTitle would have matched. The
+  // strict-PID rule is the more reliable signal in that scenario.
+  const terminals = [T(0, '✳ Address foo', 100, '/Users/u/proj')];
+  const signal = {
+    pids: [400],
+    shellPid: 999,                    // not in any terminal
+    workspaceRoot: '/Users/u/proj',
+    pidChainSource: 'ps',             // strict-PID applies
+    aiTitle: 'Address foo'            // would match if reached
+  };
+  const m = matchTerminal(terminals, signal);
+  assert.strictEqual(m, null, 'strict-PID must short-circuit BEFORE ai-title tier runs');
+});
+
 test('isDefaultShellName covers common shells', () => {
   for (const n of ['bash', 'Bash', ' powershell ', 'pwsh', 'cmd', 'zsh', 'fish', 'sh']) {
     assert.ok(isDefaultShellName(n), `${n} should be default`);
