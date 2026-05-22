@@ -86,9 +86,10 @@ function activate(context) {
     try {
       const { installWinProtocol } = require('./lib/win-protocol');
       const bundledLauncherPath = path.join(context.extensionPath, 'dist', 'win-click-handler.js');
-      const result = installWinProtocol({ bundledLauncherPath });
+      const bundledHideVbsPath = path.join(context.extensionPath, 'dist', 'hide.vbs');
+      const result = installWinProtocol({ bundledLauncherPath, bundledHideVbsPath });
       if (result.ok) {
-        log.appendLine(`Windows click-handler registered: launcher=${result.launcherPath} node=${result.nodeExe}`);
+        log.appendLine(`Windows click-handler registered: launcher=${result.launcherPath} node=${result.nodeExe} hideVbs=${result.hideVbsPath || 'unavailable (will flash console window)'}`);
       } else {
         log.appendLine(`Windows click-handler registration failed (OS-banner click will fall back to no-op): ${result.error}`);
       }

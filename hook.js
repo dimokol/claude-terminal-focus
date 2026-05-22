@@ -462,37 +462,75 @@ try {
       // BOM so Windows PowerShell 5.1 reads the .ps1 as UTF-8 instead of
       // CP1252 — without it, the em-dash in titles becomes "â€"".
       fs.writeFileSync(tmpScript, '﻿' + psScriptBody, 'utf8');
-      // cmd.exe /c start "" /B powershell ... — the cmd/start indirection
-      // is what makes the toast actually fire. Direct spawn (3.5.1's
-      // attempt) leaves the powershell child inside Claude Code's hook
-      // job object on Windows. When Claude's hook subsystem closes its
-      // job handle right after our process.exit(0), the job's
-      // KILL_ON_JOB_CLOSE policy can tear down the still-cold PS process
-      // BEFORE it reaches WinRT's ToastNotificationManager.Show(). The
-      // hook's process.exit(0) doesn't help — job teardown isn't gated
-      // on the parent being alive, it's gated on the JOB HANDLE being
-      // closed. `start ""` detaches into a fresh process group that
-      // breaks away from the inherited job, so PS survives. Trade-off:
-      // under Git Bash + hidden cmd this re-introduces a brief PS console
-      // flash that 3.5.1 fixed, because `start /B` can't inherit the
-      // hidden cmd's (non-existent) console and the OS allocates a fresh
-      // one before -WindowStyle Hidden takes effect. Acceptable: a tiny
-      // flash beats notifications not firing at all. Long-term fix:
-      // Node 22.5+'s `windowsCreateProcessFlags: ['CREATE_BREAKAWAY_FROM_JOB']`
-      // would give a flash-free job break, but we can't require that
-      // until the user-installed Node baseline catches up.
-      const child = spawn('cmd.exe', [
-        '/c', 'start', '""', '/B',
-        'powershell.exe',
-        '-NoProfile', '-NonInteractive',
-        '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-        '-File', tmpScript
-      ], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true
-      });
-      child.unref();
+      // Two-path spawn:
+      //
+      //   Path A (Node ≥ 22.5):
+      //     Direct powershell.exe spawn with
+      //       windowsCreateProcessFlags: CREATE_BREAKAWAY_FROM_JOB |
+      //                                  DETACHED_PROCESS |
+      //                                  CREATE_NO_WINDOW
+      //     The BREAKAWAY flag escapes Claude Code's hook job object so
+      //     PS isn't killed when the parent's job handle closes (the
+      //     reason 3.5.1's plain detached spawn dropped the toast). The
+      //     CREATE_NO_WINDOW + DETACHED_PROCESS pair suppresses any
+      //     console-window allocation at CreateProcess time, so no PS
+      //     window EVER flashes — fixes the cosmetic regression that
+      //     cmd/start reintroduced under Git Bash.
+      //
+      //   Path B (Node < 22.5):
+      //     Fallback to the legacy cmd /c start "" /B chain. Loses the
+      //     no-flash property but preserves toast firing. Documented
+      //     compromise until our installed-Node floor catches up.
+      const supportsFlags = (() => {
+        try {
+          const [major, minor] = process.versions.node.split('.').map(n => parseInt(n, 10));
+          return major > 22 || (major === 22 && minor >= 5);
+        } catch (_) {
+          return false;
+        }
+      })();
+
+      if (supportsFlags) {
+        try {
+          const child = spawn('powershell.exe', [
+            '-NoProfile', '-NonInteractive',
+            '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+            '-File', tmpScript
+          ], {
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: true,
+            windowsCreateProcessFlags: ['CREATE_BREAKAWAY_FROM_JOB', 'DETACHED_PROCESS', 'CREATE_NO_WINDOW']
+          });
+          child.unref();
+        } catch (e) {
+          // Defensive: if the job doesn't allow BREAKAWAY (Job security
+          // limits with JOB_OBJECT_LIMIT_BREAKAWAY_OK unset), CreateProcess
+          // returns ERROR_ACCESS_DENIED. Fall back to cmd/start which
+          // escapes via a different mechanism.
+          const child = spawn('cmd.exe', [
+            '/c', 'start', '""', '/B',
+            'powershell.exe',
+            '-NoProfile', '-NonInteractive',
+            '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+            '-File', tmpScript
+          ], { detached: true, stdio: 'ignore', windowsHide: true });
+          child.unref();
+        }
+      } else {
+        const child = spawn('cmd.exe', [
+          '/c', 'start', '""', '/B',
+          'powershell.exe',
+          '-NoProfile', '-NonInteractive',
+          '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+          '-File', tmpScript
+        ], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true
+        });
+        child.unref();
+      }
     } catch (_) {
       try { fs.unlinkSync(tmpScript); } catch (_) {}
     }

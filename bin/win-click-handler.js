@@ -76,6 +76,16 @@ function focusHwndByPid(targetPid, budgetMs) {
 
   // Inline PS script. Args: target PID as a single decimal integer.
   // Exit 0 = focused; non-zero = no matching window or P/Invoke failure.
+  //
+  // The naive SetForegroundWindow call from a background process is
+  // blocked by Windows 10/11 — it only flashes the taskbar button. The
+  // workaround is to temporarily AttachThreadInput from our thread to
+  // the foreground window's thread; that lets us inherit the focus
+  // privilege long enough to call BringWindowToTop + SetForegroundWindow
+  // for real. We must detach afterward to avoid input lock-up.
+  // AllowSetForegroundWindow on the target PID is kept as a belt-and-
+  // suspenders measure for the case where the shell already granted us
+  // foreground rights via the URL-protocol activation path.
   const psScript = `
 $ErrorActionPreference = 'Stop'
 $targetPid = [uint32]${targetPid}
@@ -90,9 +100,13 @@ public class CN_Win32 {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint pid);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 }
 "@
 
@@ -117,9 +131,31 @@ if ($found -eq [IntPtr]::Zero) {
   exit 2
 }
 
+# Belt-and-suspenders foreground permission grant.
 [CN_Win32]::AllowSetForegroundWindow($targetPid) | Out-Null
-if ([CN_Win32]::IsIconic($found)) { [CN_Win32]::ShowWindow($found, 9) | Out-Null }  # SW_RESTORE
-if (-not [CN_Win32]::SetForegroundWindow($found)) {
+
+# AttachThreadInput trick — temporarily merge our thread's input queue
+# with the foreground window's thread so that Windows treats us as
+# having focus privilege. Required because a URL-protocol-handler-spawned
+# process otherwise only succeeds at flashing the taskbar button.
+$currentThread = [CN_Win32]::GetCurrentThreadId()
+$foregroundHwnd = [CN_Win32]::GetForegroundWindow()
+$dummyPid = [uint32]0
+$foregroundThread = [CN_Win32]::GetWindowThreadProcessId($foregroundHwnd, [ref]$dummyPid)
+$attached = $false
+if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread) {
+  $attached = [CN_Win32]::AttachThreadInput($currentThread, $foregroundThread, $true)
+}
+
+try {
+  if ([CN_Win32]::IsIconic($found)) { [CN_Win32]::ShowWindow($found, 9) | Out-Null }  # SW_RESTORE
+  [CN_Win32]::BringWindowToTop($found) | Out-Null
+  $ok = [CN_Win32]::SetForegroundWindow($found)
+} finally {
+  if ($attached) { [CN_Win32]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null }
+}
+
+if (-not $ok) {
   Write-Error "SetForegroundWindow failed"
   exit 3
 }

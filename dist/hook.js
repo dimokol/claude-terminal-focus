@@ -638,8 +638,8 @@ var require_win_protocol = __commonJS({
         return null;
       }
     }
-    function buildRegisterCommands({ nodeExe, launcherPath }) {
-      const shellCommand = `"${nodeExe}" "${launcherPath}" "%1"`;
+    function buildRegisterCommands({ nodeExe, launcherPath, hideVbsPath }) {
+      const shellCommand = hideVbsPath ? `wscript.exe "${hideVbsPath}" "${nodeExe}" "${launcherPath}" "%1"` : `"${nodeExe}" "${launcherPath}" "%1"`;
       return [
         {
           bin: "reg.exe",
@@ -712,7 +712,9 @@ var require_win_protocol = __commonJS({
     }
     function installWinProtocol({
       bundledLauncherPath,
+      bundledHideVbsPath,
       launcherSource,
+      hideVbsSource,
       nodeExe,
       env = process.env,
       home = os2.homedir(),
@@ -721,6 +723,7 @@ var require_win_protocol = __commonJS({
     } = {}) {
       const launcherDir = getLauncherDir(env, home);
       const launcherPath = path2.join(launcherDir, "win-click-handler.js");
+      const hideVbsPath = path2.join(launcherDir, "hide.vbs");
       const resolvedNode = nodeExe || resolveNodeExe();
       try {
         fsLike.mkdirSync(launcherDir, { recursive: true });
@@ -729,14 +732,30 @@ var require_win_protocol = __commonJS({
       } catch (e) {
         return { ok: false, error: `write launcher: ${e.message}` };
       }
-      const cmds = buildRegisterCommands({ nodeExe: resolvedNode, launcherPath });
+      let hideVbsAvailable = false;
+      try {
+        let vbsContent = hideVbsSource;
+        if (vbsContent == null && bundledHideVbsPath && fs2.existsSync(bundledHideVbsPath)) {
+          vbsContent = fs2.readFileSync(bundledHideVbsPath, "utf8");
+        }
+        if (vbsContent != null) {
+          fsLike.writeFileSync(hideVbsPath, vbsContent);
+          hideVbsAvailable = true;
+        }
+      } catch (_) {
+      }
+      const cmds = buildRegisterCommands({
+        nodeExe: resolvedNode,
+        launcherPath,
+        hideVbsPath: hideVbsAvailable ? hideVbsPath : void 0
+      });
       for (const cmd of cmds) {
         const res = runRegLike(cmd.bin, cmd.args);
         if (!res || res.status !== 0) {
           return { ok: false, error: `reg ${cmd.args[0]}: ${res && res.stderr || "unknown error"}` };
         }
       }
-      return { ok: true, launcherPath, nodeExe: resolvedNode };
+      return { ok: true, launcherPath, hideVbsPath: hideVbsAvailable ? hideVbsPath : null, nodeExe: resolvedNode };
     }
     function uninstallWinProtocol({ runRegLike = defaultRunReg } = {}) {
       const cmd = buildUnregisterCommand();
@@ -1099,26 +1118,72 @@ try {
 `;
     try {
       fs.writeFileSync(tmpScript, "\uFEFF" + psScriptBody, "utf8");
-      const child = spawn("cmd.exe", [
-        "/c",
-        "start",
-        '""',
-        "/B",
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        tmpScript
-      ], {
-        detached: true,
-        stdio: "ignore",
-        windowsHide: true
-      });
-      child.unref();
+      const supportsFlags = (() => {
+        try {
+          const [major, minor] = process.versions.node.split(".").map((n) => parseInt(n, 10));
+          return major > 22 || major === 22 && minor >= 5;
+        } catch (_) {
+          return false;
+        }
+      })();
+      if (supportsFlags) {
+        try {
+          const child = spawn("powershell.exe", [
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            tmpScript
+          ], {
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true,
+            windowsCreateProcessFlags: ["CREATE_BREAKAWAY_FROM_JOB", "DETACHED_PROCESS", "CREATE_NO_WINDOW"]
+          });
+          child.unref();
+        } catch (e) {
+          const child = spawn("cmd.exe", [
+            "/c",
+            "start",
+            '""',
+            "/B",
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            tmpScript
+          ], { detached: true, stdio: "ignore", windowsHide: true });
+          child.unref();
+        }
+      } else {
+        const child = spawn("cmd.exe", [
+          "/c",
+          "start",
+          '""',
+          "/B",
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          tmpScript
+        ], {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true
+        });
+        child.unref();
+      }
     } catch (_) {
       try {
         fs.unlinkSync(tmpScript);

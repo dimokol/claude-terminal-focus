@@ -36,8 +36,8 @@ var require_win_protocol = __commonJS({
         return null;
       }
     }
-    function buildRegisterCommands({ nodeExe, launcherPath }) {
-      const shellCommand = `"${nodeExe}" "${launcherPath}" "%1"`;
+    function buildRegisterCommands({ nodeExe, launcherPath, hideVbsPath }) {
+      const shellCommand = hideVbsPath ? `wscript.exe "${hideVbsPath}" "${nodeExe}" "${launcherPath}" "%1"` : `"${nodeExe}" "${launcherPath}" "%1"`;
       return [
         {
           bin: "reg.exe",
@@ -110,7 +110,9 @@ var require_win_protocol = __commonJS({
     }
     function installWinProtocol({
       bundledLauncherPath,
+      bundledHideVbsPath,
       launcherSource,
+      hideVbsSource,
       nodeExe,
       env = process.env,
       home = os2.homedir(),
@@ -119,6 +121,7 @@ var require_win_protocol = __commonJS({
     } = {}) {
       const launcherDir = getLauncherDir(env, home);
       const launcherPath = path2.join(launcherDir, "win-click-handler.js");
+      const hideVbsPath = path2.join(launcherDir, "hide.vbs");
       const resolvedNode = nodeExe || resolveNodeExe();
       try {
         fsLike.mkdirSync(launcherDir, { recursive: true });
@@ -127,14 +130,30 @@ var require_win_protocol = __commonJS({
       } catch (e) {
         return { ok: false, error: `write launcher: ${e.message}` };
       }
-      const cmds = buildRegisterCommands({ nodeExe: resolvedNode, launcherPath });
+      let hideVbsAvailable = false;
+      try {
+        let vbsContent = hideVbsSource;
+        if (vbsContent == null && bundledHideVbsPath && fs2.existsSync(bundledHideVbsPath)) {
+          vbsContent = fs2.readFileSync(bundledHideVbsPath, "utf8");
+        }
+        if (vbsContent != null) {
+          fsLike.writeFileSync(hideVbsPath, vbsContent);
+          hideVbsAvailable = true;
+        }
+      } catch (_) {
+      }
+      const cmds = buildRegisterCommands({
+        nodeExe: resolvedNode,
+        launcherPath,
+        hideVbsPath: hideVbsAvailable ? hideVbsPath : void 0
+      });
       for (const cmd of cmds) {
         const res = runRegLike(cmd.bin, cmd.args);
         if (!res || res.status !== 0) {
           return { ok: false, error: `reg ${cmd.args[0]}: ${res && res.stderr || "unknown error"}` };
         }
       }
-      return { ok: true, launcherPath, nodeExe: resolvedNode };
+      return { ok: true, launcherPath, hideVbsPath: hideVbsAvailable ? hideVbsPath : null, nodeExe: resolvedNode };
     }
     function uninstallWinProtocol({ runRegLike = defaultRunReg } = {}) {
       const cmd = buildUnregisterCommand();
@@ -480,9 +499,13 @@ public class CN_Win32 {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint pid);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 }
 "@
 
@@ -507,9 +530,31 @@ if ($found -eq [IntPtr]::Zero) {
   exit 2
 }
 
+# Belt-and-suspenders foreground permission grant.
 [CN_Win32]::AllowSetForegroundWindow($targetPid) | Out-Null
-if ([CN_Win32]::IsIconic($found)) { [CN_Win32]::ShowWindow($found, 9) | Out-Null }  # SW_RESTORE
-if (-not [CN_Win32]::SetForegroundWindow($found)) {
+
+# AttachThreadInput trick \u2014 temporarily merge our thread's input queue
+# with the foreground window's thread so that Windows treats us as
+# having focus privilege. Required because a URL-protocol-handler-spawned
+# process otherwise only succeeds at flashing the taskbar button.
+$currentThread = [CN_Win32]::GetCurrentThreadId()
+$foregroundHwnd = [CN_Win32]::GetForegroundWindow()
+$dummyPid = [uint32]0
+$foregroundThread = [CN_Win32]::GetWindowThreadProcessId($foregroundHwnd, [ref]$dummyPid)
+$attached = $false
+if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread) {
+  $attached = [CN_Win32]::AttachThreadInput($currentThread, $foregroundThread, $true)
+}
+
+try {
+  if ([CN_Win32]::IsIconic($found)) { [CN_Win32]::ShowWindow($found, 9) | Out-Null }  # SW_RESTORE
+  [CN_Win32]::BringWindowToTop($found) | Out-Null
+  $ok = [CN_Win32]::SetForegroundWindow($found)
+} finally {
+  if ($attached) { [CN_Win32]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null }
+}
+
+if (-not $ok) {
   Write-Error "SetForegroundWindow failed"
   exit 3
 }

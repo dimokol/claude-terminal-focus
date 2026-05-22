@@ -207,6 +207,87 @@ test('installHooks is idempotent on Windows-style paths (no duplicate accumulati
   }
 });
 
+test('installHooks migrates pre-3.5.4 entries with double-escaped backslashes (Ada\'s 13-entry case)', () => {
+  // Real-world repro from Ada's Windows live-test 2026-05-21: 12 pre-existing
+  // hook entries from 3.5.0–3.5.3 had command strings in memory like
+  //   `node "C:\\Users\\Ada\\.claude\\claude-notifications\\hook.cjs"`
+  // (literal `\\` two-char sequences from the old JSON.stringify(path) bug).
+  // The 3.5.4 OUR_HOOK_IDENTIFIERS only looked for `\hook.cjs` (single
+  // backslash) → didn't match → strip filter skipped → 13th entry got
+  // appended on next activation. Fix: identifiers now include both the
+  // `\hook.cjs` and `\\hook.cjs` substring variants.
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+
+  // Pre-existing 12 entries with the legacy double-backslash command form.
+  // The literal `\\` in the command string is what JSON.parse returns after
+  // reading the old settings.json that JSON.stringify(path) double-escaped.
+  const legacyCmd = 'node "C:\\\\Users\\\\Ada\\\\.claude\\\\claude-notifications\\\\hook.cjs"';
+  const legacyUpCmd = 'node "C:\\\\Users\\\\Ada\\\\.claude\\\\claude-notifications\\\\hook-user-prompt.cjs"';
+  const entry = c => ({ matcher: '', hooks: [{ type: 'command', command: c }] });
+  const hooks = {
+    Stop: Array(12).fill(0).map(() => entry(legacyCmd)),
+    Notification: Array(12).fill(0).map(() => entry(legacyCmd)),
+    PermissionRequest: Array(12).fill(0).map(() => entry(legacyCmd)),
+    UserPromptSubmit: Array(12).fill(0).map(() => entry(legacyUpCmd))
+  };
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks }, null, 2));
+
+  // Run installHooks (simulating the auto-migration on first 3.5.4
+  // activation). The strip filter MUST now recognize all 12 legacy
+  // entries and collapse to 1.
+  const winWrapper = {
+    hookPath:           'C:\\Users\\Ada\\.claude\\claude-notifications\\hook.cjs',
+    userPromptHookPath: 'C:\\Users\\Ada\\.claude\\claude-notifications\\hook-user-prompt.cjs'
+  };
+  const result = installHooks(winWrapper, { settingsPath });
+  assert.strictEqual(result.success, true, result.message);
+
+  const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  for (const event of ['Stop', 'Notification', 'PermissionRequest', 'UserPromptSubmit']) {
+    assert.strictEqual(after.hooks[event].length, 1,
+      `${event}: expected exactly 1 entry after migration, got ${after.hooks[event].length}`);
+  }
+
+  // checkHookStatus must report 'installed' on the migrated config.
+  const status = checkHookStatus(winWrapper.hookPath, settingsPath);
+  assert.strictEqual(status.status, 'installed',
+    `expected 'installed' post-migration, got '${status.status}'`);
+});
+
+test('checkHookStatus detects legacy double-backslash entries as ours (not "not-installed")', () => {
+  // The OTHER half of Ada's bug: even WITHOUT calling installHooks, just
+  // checkHookStatus on a settings.json full of legacy entries must report
+  // a known status (installed or stale-path), NOT 'not-installed' — which
+  // would trigger the first-run install path to APPEND another entry.
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+
+  const legacyCmd = 'node "C:\\\\Users\\\\Ada\\\\.claude\\\\claude-notifications\\\\hook.cjs"';
+  const legacyUpCmd = 'node "C:\\\\Users\\\\Ada\\\\.claude\\\\claude-notifications\\\\hook-user-prompt.cjs"';
+  const entry = c => ({ matcher: '', hooks: [{ type: 'command', command: c }] });
+  fs.writeFileSync(settingsPath, JSON.stringify({
+    hooks: {
+      Stop: [entry(legacyCmd)],
+      Notification: [entry(legacyCmd)],
+      PermissionRequest: [entry(legacyCmd)],
+      UserPromptSubmit: [entry(legacyUpCmd)]
+    }
+  }, null, 2));
+
+  const expectedHookPath = 'C:\\Users\\Ada\\.claude\\claude-notifications\\hook.cjs';
+  const status = checkHookStatus(expectedHookPath, settingsPath);
+
+  // The legacy command extracted from the regex match will contain the
+  // double-backslash path. After path.resolve normalization, it may or may
+  // not equal the expected single-backslash path. Either way, the status
+  // must NOT be 'not-installed' — that's the bug we're guarding against.
+  assert.notStrictEqual(status.status, 'not-installed',
+    `pre-fix this returned 'not-installed', causing duplicate-entry append. Got '${status.status}'.`);
+});
+
 test('installHooks is idempotent on POSIX paths (no duplicate accumulation)', () => {
   const home = makeTempHome();
   const settingsPath = path.join(home, '.claude/settings.json');
