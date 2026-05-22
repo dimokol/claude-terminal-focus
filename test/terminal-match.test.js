@@ -165,6 +165,84 @@ test('real-world scenario: her bug report log', () => {
   assert.strictEqual(m.tier, 'claude-marker');
 });
 
+// Strict-PID rule (v3.5.4): when signal has a reliable shellPid (POSIX-style
+// pidChainSource='ps') and NO terminal has matching pid, do NOT fall through
+// to cwd/marker tiers — they would falsely match a sibling Claude session
+// sharing the same workspace.
+
+test('strict-pid (POSIX): shellPid set, no terminal pid matches → null even if cwd would', () => {
+  // User has two Claude sessions in the same workspace. Window's active
+  // terminal is session A. Signal fires from session B (different shellPid).
+  // tier=pid would miss (B's shellPid not in window's terminals), tier=cwd
+  // would match A's cwd → false positive without strict rule.
+  const terminals = [T(0, '✳ Session A', 200, '/Users/u/proj')];
+  const signal = {
+    pids: [400, 300, 250, 1],
+    shellPid: 250,                  // session B's shell — not present here
+    workspaceRoot: '/Users/u/proj',
+    pidChainSource: 'ps'
+  };
+  const m = matchTerminal(terminals, signal);
+  assert.strictEqual(m, null, 'POSIX with reliable shellPid + no match must return null');
+});
+
+test('strict-pid (POSIX): shellPid set, terminal pid matches → returns the match', () => {
+  // Sanity check: positive case still works.
+  const terminals = [T(0, '✳ Session B', 250, '/Users/u/proj')];
+  const signal = {
+    pids: [400, 300, 250, 1],
+    shellPid: 250,
+    workspaceRoot: '/Users/u/proj',
+    pidChainSource: 'ps'
+  };
+  const m = matchTerminal(terminals, signal);
+  assert.strictEqual(m.index, 0);
+  assert.strictEqual(m.tier, 'pid');
+});
+
+test('strict-pid does NOT apply on Windows (pidChainSource="powershell")', () => {
+  // Git Bash + Windows: shellPid is set but masked by MSYS2/winpty, so it
+  // won't match terminal.processId. The cwd/marker fallbacks must still
+  // work — that was the original v3.4.0 use case.
+  const terminals = [T(0, '✳ Session', 999, 'd:/proj')];
+  const signal = {
+    pids: [400, 300, 250, 1],
+    shellPid: 250,                  // masked, doesn't appear in terminal.pid
+    workspaceRoot: 'd:/proj',
+    pidChainSource: 'powershell'    // Windows snapshot
+  };
+  const m = matchTerminal(terminals, signal);
+  assert.strictEqual(m.index, 0);
+  assert.strictEqual(m.tier, 'cwd');
+});
+
+test('strict-pid does NOT apply when signal lacks pidChainSource (legacy / unknown)', () => {
+  // Defensive: missing field should not block matching — be permissive.
+  const terminals = [T(0, '✳ Session', 999, '/Users/u/proj')];
+  const signal = {
+    pids: [400, 300, 250, 1],
+    shellPid: 250,
+    workspaceRoot: '/Users/u/proj'
+    // pidChainSource omitted
+  };
+  const m = matchTerminal(terminals, signal);
+  assert.strictEqual(m.tier, 'cwd', 'unknown chain source should fall through to cwd');
+});
+
+test('strict-pid: signal without shellPid → not applied (no claim of reliability)', () => {
+  // If hook.js couldn't determine shellPid, we have nothing to be strict
+  // about — fall through to cwd/marker as before.
+  const terminals = [T(0, '✳ Session', 999, '/Users/u/proj')];
+  const signal = {
+    pids: [400, 300, 250, 1],
+    workspaceRoot: '/Users/u/proj',
+    pidChainSource: 'ps'
+    // shellPid omitted
+  };
+  const m = matchTerminal(terminals, signal);
+  assert.strictEqual(m.tier, 'cwd');
+});
+
 test('isDefaultShellName covers common shells', () => {
   for (const n of ['bash', 'Bash', ' powershell ', 'pwsh', 'cmd', 'zsh', 'fish', 'sh']) {
     assert.ok(isDefaultShellName(n), `${n} should be default`);
