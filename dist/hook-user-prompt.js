@@ -60,6 +60,7 @@ var require_stage_dedup = __commonJS({
     var { getStateDir: getStateDir2, getSessionsPath } = require_state_paths();
     var SESSIONS_PRUNE_MS = 60 * 60 * 1e3;
     var STAGE_ESCAPE_VALVE_MS = 3e3;
+    var PR_NOTIFICATION_BURST_MS = 3e4;
     var LOCK_WAIT_MS = 1e3;
     var LOCK_SLEEP_MS = 5;
     var LOCK_STALE_MS = 2e3;
@@ -141,7 +142,7 @@ var require_stage_dedup = __commonJS({
         }
       }
     }
-    function shouldNotify(workspaceRoot, sessionId, currentEvent) {
+    function shouldNotify(workspaceRoot, sessionId, currentEvent, currentHookEventName) {
       if (!sessionId) return { notify: true, stageId: null };
       const lock = acquireLock(workspaceRoot);
       try {
@@ -149,13 +150,29 @@ var require_stage_dedup = __commonJS({
         const now = Date.now();
         let entry = map[sessionId];
         if (!entry) {
-          entry = { stageId: 1, lastEvent: currentEvent, resolved: false, lastNotifiedAt: now, updatedAt: now };
+          entry = {
+            stageId: 1,
+            lastEvent: currentEvent,
+            lastHookEventName: currentHookEventName || null,
+            resolved: false,
+            lastNotifiedAt: now,
+            updatedAt: now
+          };
           map[sessionId] = entry;
           writeSessions(workspaceRoot, map);
           return { notify: true, stageId: 1 };
         }
+        const lastHook = entry.lastHookEventName;
+        if ((lastHook === "PermissionRequest" || lastHook === "PreToolUse") && currentHookEventName === "Notification" && now - (entry.lastNotifiedAt || 0) < PR_NOTIFICATION_BURST_MS) {
+          entry.lastEvent = currentEvent;
+          entry.lastHookEventName = currentHookEventName;
+          entry.updatedAt = now;
+          writeSessions(workspaceRoot, map);
+          return { notify: false, stageId: entry.stageId };
+        }
         if (entry.lastEvent === null) {
           entry.lastEvent = currentEvent;
+          entry.lastHookEventName = currentHookEventName || null;
           entry.resolved = false;
           entry.lastNotifiedAt = now;
           entry.updatedAt = now;
@@ -166,12 +183,14 @@ var require_stage_dedup = __commonJS({
           const lastAt2 = entry.lastNotifiedAt || 0;
           if (now - lastAt2 < STAGE_ESCAPE_VALVE_MS) {
             entry.lastEvent = currentEvent;
+            entry.lastHookEventName = currentHookEventName || entry.lastHookEventName || null;
             entry.updatedAt = now;
             writeSessions(workspaceRoot, map);
             return { notify: false, stageId: entry.stageId };
           }
           entry.stageId = (entry.stageId || 0) + 1;
           entry.lastEvent = currentEvent;
+          entry.lastHookEventName = currentHookEventName || null;
           entry.resolved = false;
           entry.lastNotifiedAt = now;
           entry.updatedAt = now;
@@ -182,6 +201,7 @@ var require_stage_dedup = __commonJS({
         if (now - lastAt > STAGE_ESCAPE_VALVE_MS) {
           entry.stageId = (entry.stageId || 0) + 1;
           entry.lastEvent = currentEvent;
+          entry.lastHookEventName = currentHookEventName || null;
           entry.resolved = false;
           entry.lastNotifiedAt = now;
           entry.updatedAt = now;
@@ -189,6 +209,7 @@ var require_stage_dedup = __commonJS({
           return { notify: true, stageId: entry.stageId };
         }
         entry.lastEvent = currentEvent;
+        entry.lastHookEventName = currentHookEventName || entry.lastHookEventName || null;
         entry.updatedAt = now;
         writeSessions(workspaceRoot, map);
         return { notify: false, stageId: entry.stageId };
@@ -202,9 +223,10 @@ var require_stage_dedup = __commonJS({
       try {
         const map = readSessions(workspaceRoot);
         const now = Date.now();
-        const entry = map[sessionId] || { stageId: 0, lastEvent: null, resolved: false, lastNotifiedAt: 0, updatedAt: now };
+        const entry = map[sessionId] || { stageId: 0, lastEvent: null, lastHookEventName: null, resolved: false, lastNotifiedAt: 0, updatedAt: now };
         entry.stageId = (entry.stageId || 0) + 1;
         entry.lastEvent = null;
+        entry.lastHookEventName = null;
         entry.resolved = false;
         entry.updatedAt = now;
         map[sessionId] = entry;
@@ -230,6 +252,7 @@ var require_stage_dedup = __commonJS({
     module2.exports = {
       SESSIONS_PRUNE_MS,
       STAGE_ESCAPE_VALVE_MS,
+      PR_NOTIFICATION_BURST_MS,
       LOCK_WAIT_MS,
       LOCK_STALE_MS,
       shouldNotify,

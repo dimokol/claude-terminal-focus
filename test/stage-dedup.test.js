@@ -3,7 +3,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { shouldNotify, advanceOnPrompt, markResolved, _readSessions, STAGE_ESCAPE_VALVE_MS } = require('../lib/stage-dedup');
+const { shouldNotify, advanceOnPrompt, markResolved, _readSessions, STAGE_ESCAPE_VALVE_MS, PR_NOTIFICATION_BURST_MS } = require('../lib/stage-dedup');
 const { stateDir } = require('./helpers');
 
 function backdateLastNotified(root, sessionId, msAgo) {
@@ -180,4 +180,94 @@ test('missing session_id treats as unique per call', () => {
   const r2 = shouldNotify(root, '', 'completed');
   assert.strictEqual(r1.notify, true);
   assert.strictEqual(r2.notify, true);
+});
+
+// PR→Notification burst guard (v3.5.4) — AskUserQuestion's PermissionRequest
+// and Notification often fire MORE than 3s apart (focus shifts, slow tool UI,
+// user reading the prompt before answering inline). The 3s escape valve was
+// firing for Notification, producing two distinct sounds for one logical
+// attention point. The PR_NOTIFICATION_BURST_MS=30s window catches this.
+
+test('PR→Notification burst guard: same session, within 30s → Notification suppressed', () => {
+  const root = tmpWorkspace();
+  // PR fires first.
+  const r1 = shouldNotify(root, 'sess-a', 'waiting', 'PermissionRequest');
+  assert.strictEqual(r1.notify, true);
+  assert.strictEqual(r1.stageId, 1);
+
+  // Backdate lastNotifiedAt to simulate 5s gap — past the 3s escape valve,
+  // but still inside the PR_NOTIFICATION_BURST_MS=30s window.
+  const map = _readSessions(root);
+  map['sess-a'].lastNotifiedAt = Date.now() - 5000;
+  const fs = require('fs');
+  const { stateDir } = require('./helpers');
+  fs.writeFileSync(path.join(stateDir(root), 'sessions'), JSON.stringify(map));
+
+  // Notification follows. Pre-fix this hit the escape valve and notified again.
+  const r2 = shouldNotify(root, 'sess-a', 'waiting', 'Notification');
+  assert.strictEqual(r2.notify, false, 'PR→Notification within 30s must be suppressed as same attention point');
+  assert.strictEqual(r2.stageId, 1, 'stage must not advance');
+
+  const entry = _readSessions(root)['sess-a'];
+  assert.strictEqual(entry.lastHookEventName, 'Notification', 'lastHookEventName must track the latest');
+});
+
+test('PR→Notification burst guard: outside 30s → escape valve still fires', () => {
+  const root = tmpWorkspace();
+  shouldNotify(root, 'sess-a', 'waiting', 'PermissionRequest');
+
+  // Backdate to 31s ago — beyond PR_NOTIFICATION_BURST_MS.
+  backdateLastNotified(root, 'sess-a', PR_NOTIFICATION_BURST_MS + 1000);
+
+  const r2 = shouldNotify(root, 'sess-a', 'waiting', 'Notification');
+  assert.strictEqual(r2.notify, true, 'genuine new attention point after 30s must fire');
+});
+
+test('PR→Notification burst guard: does NOT suppress Stop→Notification (different mechanism)', () => {
+  const root = tmpWorkspace();
+  shouldNotify(root, 'sess-a', 'completed', 'Stop');
+
+  // Stop+Notification is the original ~100ms platform burst. The existing
+  // unresolved-fresh-burst (3s) branch handles it. Our new guard must NOT
+  // accidentally widen this to 30s — that would suppress legitimate
+  // user-attention events after a Stop.
+  backdateLastNotified(root, 'sess-a', 5000);
+
+  const r2 = shouldNotify(root, 'sess-a', 'waiting', 'Notification');
+  assert.strictEqual(r2.notify, true, 'Stop followed by Notification at 5s gap must fire (escape valve)');
+});
+
+test('PR→Notification guard does NOT suppress when current event is PR again (new tool call)', () => {
+  const root = tmpWorkspace();
+  shouldNotify(root, 'sess-a', 'waiting', 'PermissionRequest');
+  backdateLastNotified(root, 'sess-a', 5000);
+
+  // A second PR fires (e.g., a different tool needing permission). Should NOT
+  // be suppressed by the PR→Notification guard.
+  const r2 = shouldNotify(root, 'sess-a', 'waiting', 'PermissionRequest');
+  assert.strictEqual(r2.notify, true, 'second PR after 5s gap must fire');
+});
+
+test('PreToolUse→Notification follows the same burst guard', () => {
+  const root = tmpWorkspace();
+  // PreToolUse fires for hookable tools other than AskUserQuestion.
+  shouldNotify(root, 'sess-a', 'waiting', 'PreToolUse');
+  backdateLastNotified(root, 'sess-a', 5000);
+
+  const r2 = shouldNotify(root, 'sess-a', 'waiting', 'Notification');
+  assert.strictEqual(r2.notify, false, 'PreToolUse→Notification within 30s must also collapse');
+});
+
+test('UserPromptSubmit clears lastHookEventName so next event starts fresh', () => {
+  const root = tmpWorkspace();
+  shouldNotify(root, 'sess-a', 'waiting', 'PermissionRequest');
+  advanceOnPrompt(root, 'sess-a');
+
+  const entry = _readSessions(root)['sess-a'];
+  assert.strictEqual(entry.lastHookEventName, null, 'advanceOnPrompt clears lastHookEventName');
+
+  // A Notification arriving now should not be suppressed by the PR guard
+  // because the PR-context was cleared by the prompt.
+  const r = shouldNotify(root, 'sess-a', 'waiting', 'Notification');
+  assert.strictEqual(r.notify, true);
 });

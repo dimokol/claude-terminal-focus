@@ -140,7 +140,7 @@ function xmlEsc(s) {
   // unresolved stage. Stage advances on event-type change, on previous
   // stage being resolved (user ack), or on UserPromptSubmit (handled by
   // hook-user-prompt.js). See lib/stage-dedup.js for the full state machine.
-  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent);
+  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent, hookEventName);
   if (!dedup.notify) {
     process.exit(0);
   }
