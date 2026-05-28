@@ -2,7 +2,7 @@
   "name": "claude-notifications",
   "displayName": "Claude Notifications",
   "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.",
-  "version": "3.5.4",
+  "version": "3.5.5",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
@@ -241,6 +241,12 @@
           "default": "hwnd",
           "order": 110,
           "markdownDescription": "Windows only. How the OS-banner click resolves which VS Code window to focus. Falls back to the CLI path automatically if HWND focusing fails for any reason — this setting only forces the choice up front."
+        },
+        "claudeNotifications.windows.forceForeground": {
+          "type": "boolean",
+          "default": false,
+          "order": 111,
+          "markdownDescription": "Windows only. When enabled, clicking an OS-banner notification brings the correct VS Code window to the **foreground over other apps** (instead of only flashing it in the taskbar). This works by setting Windows' `ForegroundLockTimeout` to `0` — a standard, safe, and instantly reversible per-user setting that lets apps raise their window in response to your click. Disabling this setting restores your previous value. Leave off to keep Windows' default taskbar-flash behavior."
         }
       }
     }
