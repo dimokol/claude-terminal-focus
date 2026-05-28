@@ -67,7 +67,7 @@ test('setForegroundLockTimeout returns ok:true when reg add succeeds', () => {
   const calls = [];
   const fakeRun = (bin, args) => { calls.push(args); return { status: 0, stdout: '', stderr: '' }; };
   const { setForegroundLockTimeout } = require('../lib/win-foreground-lock');
-  const r = setForegroundLockTimeout(0, { runRegLike: fakeRun });
+  const r = setForegroundLockTimeout(0, { runRegLike: fakeRun, broadcast: () => {} });
   assert.strictEqual(r.ok, true);
   assert.ok(calls[0].includes('add'));
   assert.strictEqual(calls[0][calls[0].indexOf('/d') + 1], '0');
@@ -78,4 +78,15 @@ test('setForegroundLockTimeout returns ok:false when reg add fails', () => {
   const { setForegroundLockTimeout } = require('../lib/win-foreground-lock');
   const r = setForegroundLockTimeout(0, { runRegLike: fakeRun });
   assert.strictEqual(r.ok, false);
+});
+
+test('setForegroundLockTimeout invokes broadcast on success, skips on failure', () => {
+  const { setForegroundLockTimeout } = require('../lib/win-foreground-lock');
+  let calls = 0;
+  const okRun = () => ({ status: 0, stdout: '', stderr: '' });
+  setForegroundLockTimeout(0, { runRegLike: okRun, broadcast: () => { calls++; } });
+  assert.strictEqual(calls, 1);
+  const failRun = () => ({ status: 1, stdout: '', stderr: 'x' });
+  setForegroundLockTimeout(0, { runRegLike: failRun, broadcast: () => { calls++; } });
+  assert.strictEqual(calls, 1); // unchanged — broadcast not called on failure
 });
