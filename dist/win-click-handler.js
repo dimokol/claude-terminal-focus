@@ -436,12 +436,196 @@ var require_code_instance_resolver = __commonJS({
       }
       return bestPid;
     }
+    function resolveCodeInstancePids(pids, snapshot2, maxDepth = DEFAULT_MAX_DEPTH) {
+      if (!Array.isArray(pids) || pids.length === 0) return [];
+      if (!snapshot2 || !snapshot2.procs) return [];
+      const found = [];
+      const pushUnique = (p) => {
+        if (!found.includes(p)) found.push(p);
+      };
+      for (const startPid of pids) {
+        if (!Number.isInteger(startPid) || startPid <= 0) continue;
+        let current = startPid;
+        let depth = 0;
+        const seen = /* @__PURE__ */ new Set();
+        while (depth < maxDepth) {
+          if (seen.has(current)) break;
+          seen.add(current);
+          const node = snapshot2.procs.get(current);
+          if (!node) break;
+          if (isVsCodeBinary(node.name)) {
+            pushUnique(node.pid);
+          }
+          if (!node.ppid || node.ppid === current) break;
+          current = node.ppid;
+          depth++;
+        }
+      }
+      return found;
+    }
     module2.exports = {
       VS_CODE_BINARY_PATTERN,
       isVsCodeBinary,
       findCodeAncestorPid,
       resolveCodeInstancePid: resolveCodeInstancePid2,
+      resolveCodeInstancePids,
       DEFAULT_MAX_DEPTH
+    };
+  }
+});
+
+// lib/win-focus.js
+var require_win_focus = __commonJS({
+  "lib/win-focus.js"(exports2, module2) {
+    "use strict";
+    var { spawnSync: spawnSync2, spawn: spawn2 } = require("child_process");
+    function normalizePids(pidOrPids) {
+      const arr = Array.isArray(pidOrPids) ? pidOrPids : [pidOrPids];
+      return arr.filter((p) => Number.isInteger(p) && p > 0);
+    }
+    function buildPsScript(pidOrPids) {
+      const pids = normalizePids(pidOrPids);
+      const pidList = pids.join(",");
+      return `
+$ErrorActionPreference = 'Stop'
+$targetPids = @(${pidList})
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class CN_Win32 {
+  public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hwnd, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint pid);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+}
+"@
+
+$found = [IntPtr]::Zero
+$foundPid = [uint32]0
+$cb = [CN_Win32+EnumWindowsProc] {
+  param([IntPtr]$hwnd, [IntPtr]$lParam)
+  if (-not [CN_Win32]::IsWindowVisible($hwnd)) { return $true }
+  if ([CN_Win32]::GetWindowTextLength($hwnd) -eq 0) { return $true }
+  $wpid = [uint32]0
+  [CN_Win32]::GetWindowThreadProcessId($hwnd, [ref]$wpid) | Out-Null
+  if ($targetPids -contains $wpid) {
+    Set-Variable -Scope 1 -Name found -Value $hwnd
+    Set-Variable -Scope 1 -Name foundPid -Value $wpid
+    return $false
+  }
+  return $true
+}
+
+[CN_Win32]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+
+if ($found -eq [IntPtr]::Zero) {
+  Write-Error "no visible window for pids ${pidList}"
+  exit 2
+}
+
+$currentThread = [CN_Win32]::GetCurrentThreadId()
+$ok = $false
+
+# Retry across the post-toast-click foreground settling window. When the
+# extension host spawns us right after the user clicks the toast, the
+# foreground window can briefly be the toast host / a transient window;
+# AttachThreadInput to that wrong thread fails to raise VS Code. Re-reading
+# the foreground each attempt and retrying over ~1.5s catches the settled
+# state.
+for ($i = 0; $i -lt 6 -and -not $ok; $i++) {
+  [CN_Win32]::AllowSetForegroundWindow($foundPid) | Out-Null
+  $fgHwnd = [CN_Win32]::GetForegroundWindow()
+  $fgPid = [uint32]0
+  $fgThread = [CN_Win32]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid)
+  $sb = New-Object System.Text.StringBuilder 256
+  [CN_Win32]::GetWindowText($fgHwnd, $sb, 256) | Out-Null
+  $attached = $false
+  if ($fgThread -ne 0 -and $fgThread -ne $currentThread) {
+    $attached = [CN_Win32]::AttachThreadInput($currentThread, $fgThread, $true)
+  }
+  try {
+    if ([CN_Win32]::IsIconic($found)) { [CN_Win32]::ShowWindow($found, 9) | Out-Null }
+    # Alt-key tap: synthesizing an Alt down/up gives our thread a "recent
+    # user input" event, which satisfies one of SetForegroundWindow's
+    # allow-conditions. This is the only thing that works when the
+    # foreground is "Action center" (the toast host) \u2014 AttachThreadInput
+    # to that protected UWP surface fails, but the Alt tap doesn't need it.
+    [CN_Win32]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [CN_Win32]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+    [CN_Win32]::BringWindowToTop($found) | Out-Null
+    $ok = [CN_Win32]::SetForegroundWindow($found)
+  } finally {
+    if ($attached) { [CN_Win32]::AttachThreadInput($currentThread, $fgThread, $false) | Out-Null }
+  }
+  if (-not $ok) { Start-Sleep -Milliseconds 150 }
+}
+
+if (-not $ok) {
+  Write-Error "SetForegroundWindow failed"
+  exit 3
+}
+exit 0
+`.trim();
+    }
+    function focusHwndByPid2(pidOrPids, budgetMs = 2e3) {
+      const pids = normalizePids(pidOrPids);
+      if (pids.length === 0) return false;
+      try {
+        const res = spawnSync2("powershell.exe", [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          buildPsScript(pids)
+        ], {
+          windowsHide: true,
+          timeout: budgetMs,
+          stdio: ["ignore", "ignore", "pipe"]
+        });
+        return res && res.status === 0;
+      } catch (_) {
+        return false;
+      }
+    }
+    function focusHwndByPidAsync(pidOrPids) {
+      const pids = normalizePids(pidOrPids);
+      if (pids.length === 0) return false;
+      try {
+        const child = spawn2("powershell.exe", [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          buildPsScript(pids)
+        ], {
+          stdio: "ignore",
+          windowsHide: true
+        });
+        child.unref();
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+    module2.exports = {
+      buildPsScript,
+      focusHwndByPid: focusHwndByPid2,
+      focusHwndByPidAsync
     };
   }
 });
@@ -484,99 +668,8 @@ function writeClickMarker(payload) {
   }
 }
 function focusHwndByPid(targetPid, budgetMs) {
-  if (!Number.isInteger(targetPid) || targetPid <= 0) return false;
-  const psScript = `
-$ErrorActionPreference = 'Stop'
-$targetPid = [uint32]${targetPid}
-
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class CN_Win32 {
-  public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
-  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint pid);
-  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-}
-"@
-
-$found = [IntPtr]::Zero
-$cb = [CN_Win32+EnumWindowsProc] {
-  param([IntPtr]$hwnd, [IntPtr]$lParam)
-  if (-not [CN_Win32]::IsWindowVisible($hwnd)) { return $true }
-  if ([CN_Win32]::GetWindowTextLength($hwnd) -eq 0) { return $true }
-  $wpid = [uint32]0
-  [CN_Win32]::GetWindowThreadProcessId($hwnd, [ref]$wpid) | Out-Null
-  if ($wpid -eq $targetPid) {
-    Set-Variable -Scope 1 -Name found -Value $hwnd
-    return $false
-  }
-  return $true
-}
-
-[CN_Win32]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
-
-if ($found -eq [IntPtr]::Zero) {
-  Write-Error "no visible window for pid $targetPid"
-  exit 2
-}
-
-# Belt-and-suspenders foreground permission grant.
-[CN_Win32]::AllowSetForegroundWindow($targetPid) | Out-Null
-
-# AttachThreadInput trick \u2014 temporarily merge our thread's input queue
-# with the foreground window's thread so that Windows treats us as
-# having focus privilege. Required because a URL-protocol-handler-spawned
-# process otherwise only succeeds at flashing the taskbar button.
-$currentThread = [CN_Win32]::GetCurrentThreadId()
-$foregroundHwnd = [CN_Win32]::GetForegroundWindow()
-$dummyPid = [uint32]0
-$foregroundThread = [CN_Win32]::GetWindowThreadProcessId($foregroundHwnd, [ref]$dummyPid)
-$attached = $false
-if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread) {
-  $attached = [CN_Win32]::AttachThreadInput($currentThread, $foregroundThread, $true)
-}
-
-try {
-  if ([CN_Win32]::IsIconic($found)) { [CN_Win32]::ShowWindow($found, 9) | Out-Null }  # SW_RESTORE
-  [CN_Win32]::BringWindowToTop($found) | Out-Null
-  $ok = [CN_Win32]::SetForegroundWindow($found)
-} finally {
-  if ($attached) { [CN_Win32]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null }
-}
-
-if (-not $ok) {
-  Write-Error "SetForegroundWindow failed"
-  exit 3
-}
-exit 0
-`.trim();
-  try {
-    const res = spawnSync("powershell.exe", [
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      psScript
-    ], {
-      windowsHide: true,
-      timeout: budgetMs,
-      stdio: ["ignore", "ignore", "pipe"]
-    });
-    return res && res.status === 0;
-  } catch (_) {
-    return false;
-  }
+  const { focusHwndByPid: shared } = require_win_focus();
+  return shared(targetPid, budgetMs);
 }
 function spawnCodeFallback(workspaceRoot) {
   try {
