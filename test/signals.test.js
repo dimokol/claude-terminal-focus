@@ -81,7 +81,7 @@ test('CONCURRENCY: 50 concurrent claimHandled on a STALE marker — exactly ONE 
   const workerScript = path.join(__dirname, 'fixtures', 'claim-worker.js');
   fs.mkdirSync(path.dirname(workerScript), { recursive: true });
   fs.writeFileSync(workerScript, `
-const { claimHandled } = require('${path.join(__dirname, '..', 'lib', 'signals').replace(/\\\\/g, '/')}');
+const { claimHandled } = require('${path.join(__dirname, '..', 'lib', 'signals').replace(/\\/g, '/')}');
 process.send({ ok: claimHandled(process.argv[2]) });
 `);
 

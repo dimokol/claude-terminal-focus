@@ -72,110 +72,12 @@ function writeClickMarker(payload) {
  * allocates a visible console.
  */
 function focusHwndByPid(targetPid, budgetMs) {
-  if (!Number.isInteger(targetPid) || targetPid <= 0) return false;
-
-  // Inline PS script. Args: target PID as a single decimal integer.
-  // Exit 0 = focused; non-zero = no matching window or P/Invoke failure.
-  //
-  // The naive SetForegroundWindow call from a background process is
-  // blocked by Windows 10/11 — it only flashes the taskbar button. The
-  // workaround is to temporarily AttachThreadInput from our thread to
-  // the foreground window's thread; that lets us inherit the focus
-  // privilege long enough to call BringWindowToTop + SetForegroundWindow
-  // for real. We must detach afterward to avoid input lock-up.
-  // AllowSetForegroundWindow on the target PID is kept as a belt-and-
-  // suspenders measure for the case where the shell already granted us
-  // foreground rights via the URL-protocol activation path.
-  const psScript = `
-$ErrorActionPreference = 'Stop'
-$targetPid = [uint32]${targetPid}
-
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class CN_Win32 {
-  public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
-  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
-  [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint pid);
-  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-}
-"@
-
-$found = [IntPtr]::Zero
-$cb = [CN_Win32+EnumWindowsProc] {
-  param([IntPtr]$hwnd, [IntPtr]$lParam)
-  if (-not [CN_Win32]::IsWindowVisible($hwnd)) { return $true }
-  if ([CN_Win32]::GetWindowTextLength($hwnd) -eq 0) { return $true }
-  $wpid = [uint32]0
-  [CN_Win32]::GetWindowThreadProcessId($hwnd, [ref]$wpid) | Out-Null
-  if ($wpid -eq $targetPid) {
-    Set-Variable -Scope 1 -Name found -Value $hwnd
-    return $false
-  }
-  return $true
-}
-
-[CN_Win32]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
-
-if ($found -eq [IntPtr]::Zero) {
-  Write-Error "no visible window for pid $targetPid"
-  exit 2
-}
-
-# Belt-and-suspenders foreground permission grant.
-[CN_Win32]::AllowSetForegroundWindow($targetPid) | Out-Null
-
-# AttachThreadInput trick — temporarily merge our thread's input queue
-# with the foreground window's thread so that Windows treats us as
-# having focus privilege. Required because a URL-protocol-handler-spawned
-# process otherwise only succeeds at flashing the taskbar button.
-$currentThread = [CN_Win32]::GetCurrentThreadId()
-$foregroundHwnd = [CN_Win32]::GetForegroundWindow()
-$dummyPid = [uint32]0
-$foregroundThread = [CN_Win32]::GetWindowThreadProcessId($foregroundHwnd, [ref]$dummyPid)
-$attached = $false
-if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread) {
-  $attached = [CN_Win32]::AttachThreadInput($currentThread, $foregroundThread, $true)
-}
-
-try {
-  if ([CN_Win32]::IsIconic($found)) { [CN_Win32]::ShowWindow($found, 9) | Out-Null }  # SW_RESTORE
-  [CN_Win32]::BringWindowToTop($found) | Out-Null
-  $ok = [CN_Win32]::SetForegroundWindow($found)
-} finally {
-  if ($attached) { [CN_Win32]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null }
-}
-
-if (-not $ok) {
-  Write-Error "SetForegroundWindow failed"
-  exit 3
-}
-exit 0
-`.trim();
-
-  try {
-    const res = spawnSync('powershell.exe', [
-      '-NoProfile', '-NonInteractive',
-      '-ExecutionPolicy', 'Bypass',
-      '-Command', psScript
-    ], {
-      windowsHide: true,
-      timeout: budgetMs,
-      stdio: ['ignore', 'ignore', 'pipe']
-    });
-    return res && res.status === 0;
-  } catch (_) {
-    return false;
-  }
+  // Delegated to lib/win-focus.js so extension.js's UriHandler can re-use
+  // the same AttachThreadInput-based foreground-steal logic when the click
+  // flow goes through `vscode://dimokol.claude-notifications/` instead of
+  // through this launcher.
+  const { focusHwndByPid: shared } = require('../lib/win-focus');
+  return shared(targetPid, budgetMs);
 }
 
 function spawnCodeFallback(workspaceRoot) {

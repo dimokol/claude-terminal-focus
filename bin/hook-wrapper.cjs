@@ -91,9 +91,11 @@ const SELF_IDENTIFIERS = [
 ];
 
 function selfDestruct({ home = os.homedir(), wrapperDir = __dirname } = {}) {
-  // 1. Strip hook entries from every Claude profile's settings.json.
+  // 1. Strip hook entries from every Claude profile's settings.json and
+  //    remove the .backup files installHooks leaves behind.
   for (const sp of discoverProfiles(home)) {
     try { stripFromSettings(sp, SELF_IDENTIFIERS); } catch (_) {}
+    try { fs.rmSync(sp + '.backup', { force: true }); } catch (_) {}
   }
 
   // 2. Focus-state cache.

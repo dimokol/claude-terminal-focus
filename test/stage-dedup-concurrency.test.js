@@ -18,7 +18,7 @@ const WORKER_SCRIPT = path.join(__dirname, 'fixtures', 'shouldnotify-worker.js')
 function ensureWorker() {
   fs.mkdirSync(path.dirname(WORKER_SCRIPT), { recursive: true });
   fs.writeFileSync(WORKER_SCRIPT, `
-const { shouldNotify, advanceOnPrompt } = require('${path.join(__dirname, '..', 'lib', 'stage-dedup').replace(/\\\\/g, '/')}');
+const { shouldNotify, advanceOnPrompt } = require('${path.join(__dirname, '..', 'lib', 'stage-dedup').replace(/\\/g, '/')}');
 const [workspaceRoot, sessionId, event, mode] = process.argv.slice(2);
 if (mode === 'prompt') {
   advanceOnPrompt(workspaceRoot, sessionId);
