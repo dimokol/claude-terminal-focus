@@ -32,6 +32,7 @@ const { shouldNotify: checkShouldNotify } = require('./lib/stage-dedup');
 const { buildClickMarkerPayload } = require('./lib/click-marker');
 const { readAiTitle } = require('./lib/transcript-title');
 const { snapshot: processSnapshot, walkUp } = require('./lib/process-tree');
+const { schemeForBinaryName, classifyBuild } = require('./lib/code-build');
 
 // Process names we consider "the interactive shell hosting Claude". The
 // first ancestor matching one of these is recorded as signal.shellPid —
@@ -464,11 +465,22 @@ function xmlEsc(s) {
     //
     // ── Toast launch URI ──
     //
-    // Uses `vscode://dimokol.claude-notifications/click?marker=<base64>`.
-    // VS Code shell-registers `vscode://` and routes activations matching
-    // an installed extension's id to that extension's registerUriHandler
-    // callback — so clicking the toast lands directly in our extension code
-    // with the marker payload in the URI, no file mediation.
+    // Uses `<product-scheme>://dimokol.claude-notifications/click?marker=<base64>`,
+    // where product-scheme matches the VS Code build the Claude session is
+    // running in: vscode for Stable, vscode-insiders for Insiders, and
+    // vscodium / cursor / windsurf for the common forks. We detect the build
+    // from the PID ancestor chain (the owning Code binary basename) via
+    // lib/code-build. This matters because Windows routes a bare `vscode://`
+    // to whichever build OWNS that scheme (almost always Stable), so an
+    // Insiders user clicking a vscode:// toast gets a fresh Stable window
+    // instead of their Insiders instance (GitHub #4). Each build's
+    // registerUriHandler answers its own product scheme automatically, so no
+    // extension-side change is needed; we just emit the matching scheme.
+    //
+    // VS Code routes activations matching an installed extension's id to that
+    // extension's registerUriHandler callback, so clicking the toast lands
+    // directly in our extension code with the marker payload in the URI, no
+    // file mediation.
     //
     // Why not the simpler `vscode://file/<workspace>`? It works for opening
     // the workspace but carries no per-session info — terminal switching on
@@ -492,7 +504,18 @@ function xmlEsc(s) {
       event: hookEvent, project: projectName, aiTitle
     });
     const clickMarkerB64 = Buffer.from(clickMarkerJson, 'utf8').toString('base64');
-    const toastLaunchUri = `vscode://dimokol.claude-notifications/click?marker=${encodeURIComponent(clickMarkerB64)}`;
+    // Pick the launch scheme that matches the owning VS Code build (#4).
+    // Walk the PID chain for the first VS-Code-flavored ancestor and use its
+    // product scheme; fall back to vscode:// when none is found (e.g. Claude
+    // run from a plain terminal outside any VS Code window).
+    let launchScheme = 'vscode';
+    for (const node of chain) {
+      if (node && node.name && classifyBuild(node.name)) {
+        launchScheme = schemeForBinaryName(node.name);
+        break;
+      }
+    }
+    const toastLaunchUri = `${launchScheme}://dimokol.claude-notifications/click?marker=${encodeURIComponent(clickMarkerB64)}`;
     const psScriptBody = `
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
