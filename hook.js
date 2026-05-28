@@ -59,7 +59,8 @@ function shEsc(s) {
 // the blocking "Windows Script Host: can not find script file" dialog) when
 // hide.vbs is missing.
 function buildHiddenPsArgv(tmpScript) {
-  const hideVbsPath = path.join(os.homedir(), 'AppData', 'Local', 'claude-notifications', 'hide.vbs');
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  const hideVbsPath = path.join(localAppData, 'claude-notifications', 'hide.vbs');
   const psTail = [
     'powershell.exe',
     '-NoProfile', '-NonInteractive',

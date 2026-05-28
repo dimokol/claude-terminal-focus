@@ -652,7 +652,8 @@ function shEsc(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 function buildHiddenPsArgv(tmpScript) {
-  const hideVbsPath = path.join(os.homedir(), "AppData", "Local", "claude-notifications", "hide.vbs");
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  const hideVbsPath = path.join(localAppData, "claude-notifications", "hide.vbs");
   const psTail = [
     "powershell.exe",
     "-NoProfile",
