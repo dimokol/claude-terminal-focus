@@ -159,18 +159,41 @@ test('escape valve: same-stage event within window stays suppressed', () => {
   assert.strictEqual(entry.stageId, 1, 'stage must not advance inside the burst window');
 });
 
-test('escape valve: same-stage event after window notifies and bumps stage', () => {
-  // Models the AskUserQuestion case: an unresolved stage receives a new
-  // Notification event seconds after the last one, with no upstream ack.
+test('escape valve fires for a PRIMARY event after the window (new question)', () => {
+  // A real AskUserQuestion fires PermissionRequest (a primary attention
+  // point). After the burst window, a primary must escape and notify even
+  // with no upstream ack — this is how question 2+ in a sequence fires.
   const root = tmpWorkspace();
-  shouldNotify(root, 'sess-a', 'completed');
+  shouldNotify(root, 'sess-a', 'waiting', 'PermissionRequest');
   backdateLastNotified(root, 'sess-a', STAGE_ESCAPE_VALVE_MS + 500);
-  const res = shouldNotify(root, 'sess-a', 'waiting');
-  assert.strictEqual(res.notify, true, 'delayed same-stage event must fire');
-  assert.strictEqual(res.stageId, 2, 'escape valve must bump stageId so click payload tracks the new wait');
-  const entry = _readSessions(root)['sess-a'];
-  assert.strictEqual(entry.lastEvent, 'waiting');
-  assert.strictEqual(entry.resolved, false);
+  const res = shouldNotify(root, 'sess-a', 'waiting', 'PermissionRequest');
+  assert.strictEqual(res.notify, true, 'a new PermissionRequest after the window must fire');
+  assert.strictEqual(res.stageId, 2, 'must bump stageId so the click payload tracks the new request');
+});
+
+test('escape valve does NOT fire for a bare Notification after the window (re-fire suppressed)', () => {
+  // The core fix: a Stop notifies, then Claude re-emits a bare "waiting"
+  // Notification 60s later for the SAME attention point. The old time-based
+  // escape valve let this through as a second notification (the user's
+  // "double"). A Notification is a trailer/re-fire, never a new primary, so
+  // it must be suppressed regardless of how long ago the last notify was.
+  const root = tmpWorkspace();
+  shouldNotify(root, 'sess-a', 'completed', 'Stop');
+  backdateLastNotified(root, 'sess-a', STAGE_ESCAPE_VALVE_MS + 60000);
+  const res = shouldNotify(root, 'sess-a', 'waiting', 'Notification');
+  assert.strictEqual(res.notify, false, 'a bare Notification re-fire must be suppressed even long after the window');
+  assert.strictEqual(_readSessions(root)['sess-a'].stageId, 1, 'stage must not advance on a trailer');
+});
+
+test('a completion (Stop) after the window still notifies (finish after a question)', () => {
+  // After an AskUserQuestion (PR notified), the user answers (no UPS) and
+  // Claude finishes. The Stop is a distinct attention point — it must fire.
+  const root = tmpWorkspace();
+  shouldNotify(root, 'sess-a', 'waiting', 'PermissionRequest');
+  backdateLastNotified(root, 'sess-a', STAGE_ESCAPE_VALVE_MS + 5000);
+  const res = shouldNotify(root, 'sess-a', 'completed', 'Stop');
+  assert.strictEqual(res.notify, true, 'a completion after the window must fire');
+  assert.strictEqual(res.stageId, 2);
 });
 
 test('missing session_id treats as unique per call', () => {
@@ -212,29 +235,33 @@ test('PR→Notification burst guard: same session, within 30s → Notification s
   assert.strictEqual(entry.lastHookEventName, 'Notification', 'lastHookEventName must track the latest');
 });
 
-test('PR→Notification burst guard: outside 30s → escape valve still fires', () => {
+test('PR→Notification outside 30s → still suppressed (Notification is always a trailer)', () => {
+  // Post-fix: a bare Notification is never a primary attention point, so it
+  // is suppressed no matter how long after the PR it arrives. (Previously the
+  // escape valve re-fired it after 30s — that was the source of late
+  // duplicate pings.) A genuinely new question fires its OWN PermissionRequest,
+  // which is covered by the primary-escape test above.
   const root = tmpWorkspace();
   shouldNotify(root, 'sess-a', 'waiting', 'PermissionRequest');
-
-  // Backdate to 31s ago — beyond PR_NOTIFICATION_BURST_MS.
   backdateLastNotified(root, 'sess-a', PR_NOTIFICATION_BURST_MS + 1000);
 
   const r2 = shouldNotify(root, 'sess-a', 'waiting', 'Notification');
-  assert.strictEqual(r2.notify, true, 'genuine new attention point after 30s must fire');
+  assert.strictEqual(r2.notify, false, 'a bare Notification trailer must stay suppressed even past 30s');
 });
 
-test('PR→Notification burst guard: does NOT suppress Stop→Notification (different mechanism)', () => {
+test('Stop→Notification at any gap is suppressed (the trailer/re-fire is not a new point)', () => {
+  // This used to assert the OPPOSITE (that a Notification 5s after a Stop
+  // fired a second time). That was the root of the user-reported "double":
+  // a turn completes (Stop notifies), then Claude emits a bare "waiting"
+  // Notification seconds-to-minutes later for the same point. It is a
+  // trailer, so it must be suppressed. A genuinely new wait fires its own
+  // PermissionRequest, which escapes via the primary path.
   const root = tmpWorkspace();
   shouldNotify(root, 'sess-a', 'completed', 'Stop');
-
-  // Stop+Notification is the original ~100ms platform burst. The existing
-  // unresolved-fresh-burst (3s) branch handles it. Our new guard must NOT
-  // accidentally widen this to 30s — that would suppress legitimate
-  // user-attention events after a Stop.
   backdateLastNotified(root, 'sess-a', 5000);
 
   const r2 = shouldNotify(root, 'sess-a', 'waiting', 'Notification');
-  assert.strictEqual(r2.notify, true, 'Stop followed by Notification at 5s gap must fire (escape valve)');
+  assert.strictEqual(r2.notify, false, 'a Notification after a Stop is a trailer — suppress, no double');
 });
 
 test('PR→Notification guard does NOT suppress when current event is PR again (new tool call)', () => {
