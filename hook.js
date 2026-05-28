@@ -53,6 +53,27 @@ function shEsc(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
+// Build the spawn argv for a hidden PowerShell that escapes Claude Code's
+// hook job object. Prefer the wscript+hide.vbs wrapper (no console flash);
+// fall back to plain `cmd /c start /B powershell` (brief flash, but never
+// the blocking "Windows Script Host: can not find script file" dialog) when
+// hide.vbs is missing.
+function buildHiddenPsArgv(tmpScript) {
+  const hideVbsPath = path.join(os.homedir(), 'AppData', 'Local', 'claude-notifications', 'hide.vbs');
+  const psTail = [
+    'powershell.exe',
+    '-NoProfile', '-NonInteractive',
+    '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+    '-File', tmpScript
+  ];
+  let useVbs = false;
+  try { useVbs = fs.existsSync(hideVbsPath); } catch (_) { useVbs = false; }
+  if (useVbs) {
+    return ['/c', 'start', '""', '/B', 'wscript.exe', hideVbsPath, ...psTail];
+  }
+  return ['/c', 'start', '""', '/B', ...psTail];
+}
+
 function xmlEsc(s) {
   return String(s)
     .replace(/&/g, '&amp;')
@@ -329,7 +350,16 @@ function xmlEsc(s) {
             } catch {
               try { (New-Object System.Media.SoundPlayer '${fileToPlay.replace(/'/g, "''")}').PlaySync() } catch {}
             }`.trim();
-          const child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
+          // Same job-escape + no-flash chain as the toast spawn (see the
+          // big Windows-toast block below for the full rationale).
+          // Direct `spawn('powershell', ...)` got killed by Claude Code's
+          // hook job-object teardown → no sound. `cmd /c start /B` escapes
+          // the job; wscript+hide.vbs runs PS with intWindowStyle=0 so
+          // no console window allocation flash.
+          const tmpSoundScript = path.join(os.tmpdir(), `claude-sound-${Date.now()}-${process.pid}.ps1`);
+          const soundCleanup = `\ntry {} finally { Remove-Item -LiteralPath '${tmpSoundScript.replace(/'/g, "''")}' -Force -ErrorAction SilentlyContinue }`;
+          fs.writeFileSync(tmpSoundScript, '﻿' + psCmd + soundCleanup, 'utf8');
+          const child = spawn('cmd.exe', buildHiddenPsArgv(tmpSoundScript), {
             detached: true, stdio: 'ignore', windowsHide: true
           });
           child.unref();
@@ -396,50 +426,77 @@ function xmlEsc(s) {
       } catch (_) {}
     }
   } else if (process.platform === 'win32') {
-    // Why this is convoluted: an inline `powershell -Command <script>` launched
-    // via `spawn(..., {detached:true, stdio:'ignore'})` on Windows is *not*
-    // truly orphaned — it stays inside the parent's job object. When Claude
-    // Code's hook returns and tears down its process tree, the still-cold
-    // PowerShell child can get killed before WinRT's
-    // `ToastNotificationManager.CreateToastNotifier(...).Show(...)` finishes
-    // registering the toast with the OS — sound has already fired (hook.js
-    // owns that), but the banner never appears and the toast doesn't even
-    // land in Action Center.
+    // ── Windows toast firing chain ──
     //
-    // The proven pattern (also what the v2 PS1 setup used) is:
-    //   1. Drop the script to a temp .ps1 file.
-    //   2. Launch via `cmd /c start "" /B powershell.exe -File <tmp>` —
-    //      `start` allocates a fresh process group / detaches from the
-    //      parent's job, so the toast survives the hook tearing down.
-    //   3. End the script with a small `Start-Sleep` so the WinRT call has
-    //      headroom to complete before the spawned PowerShell exits.
-    //   4. Self-delete the temp file at the end of the script (own cleanup,
-    //      no orphan files in %TEMP%).
-    // Use our claude-notif:// URI handler instead of vscode://file/.
-    // Three reasons:
-    //   1. vscode://file/ triggers VS Code's
-    //      `security.promptForLocalFileProtocolHandling` dialog every time
-    //      (default true since 1.78) — "An external application wants to
-    //      open ..." — even when the workspace is already loaded.
-    //   2. vscode://file/<path> opens a NEW window for that path; it does
-    //      not switch to an existing window that already has the workspace.
-    //      Users with "empty VS Code + folders dragged in" multi-folder
-    //      setups never get focused into their actual session.
-    //   3. Our launcher writes the click marker before launching `code`,
-    //      so the extension's existing handleClickedSignal flow runs and
-    //      focuses the matching terminal — same UX as macOS.
-    const { buildLaunchUri } = require('./lib/win-protocol');
-    const launchUri = buildLaunchUri({
+    // Two problems combine here, each ruling out the "obvious" solution
+    // to the other:
+    //
+    // 1. Claude Code's hook subsystem owns a Windows JOB OBJECT with
+    //    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set. When our hook returns,
+    //    Claude closes its handle to that job and every process inside
+    //    dies — INCLUDING our still-cold toast PowerShell that hasn't
+    //    yet reached `ToastNotificationManager.Show()`. Result: silently
+    //    no toast.
+    //
+    //    Empirically (Ada 2026-05-21 + dimokol 2026-05-23 live-tests),
+    //    the only working escape on this Claude Code build is to spawn
+    //    via `cmd /c start "" /B <target>`. The `start` builtin allocates
+    //    a fresh process group that breaks away from the inherited job,
+    //    so the PowerShell child survives. We tried Node's
+    //    `windowsCreateProcessFlags: ['CREATE_BREAKAWAY_FROM_JOB', ...]`
+    //    (3.5.4); spawn doesn't throw but BREAKAWAY is silently ineffective
+    //    on Claude Code's job (probably JOB_OBJECT_LIMIT_BREAKAWAY_OK
+    //    isn't set, but the failure is async and uncatchable), so the
+    //    cmd/start fallback was never invoked — toast just disappeared.
+    //
+    // 2. Plain `cmd /c start "" /B powershell.exe ...` flashes a console
+    //    window briefly before `-WindowStyle Hidden` takes effect, because
+    //    `start /B` can't inherit the hidden cmd's (non-existent) console
+    //    and the OS allocates a fresh one. Ada called this "PowerShell
+    //    flash"; this tester called it a "desktop refresh".
+    //
+    // Solution: chain `cmd /c start /B` (job escape) + `wscript.exe hide.vbs`
+    // (silent launcher used elsewhere by the click handler) + `powershell.exe`.
+    // hide.vbs calls `WScript.Shell.Run(cmd, 0, False)` with intWindowStyle=0,
+    // which passes hidden-window flags to CreateProcess BEFORE PowerShell
+    // starts — no window is ever allocated, nothing to flash.
+    //
+    // ── Toast launch URI ──
+    //
+    // Uses `vscode://dimokol.claude-notifications/click?marker=<base64>`.
+    // VS Code shell-registers `vscode://` and routes activations matching
+    // an installed extension's id to that extension's registerUriHandler
+    // callback — so clicking the toast lands directly in our extension code
+    // with the marker payload in the URI, no file mediation.
+    //
+    // Why not the simpler `vscode://file/<workspace>`? It works for opening
+    // the workspace but carries no per-session info — terminal switching on
+    // click would require a preemptive marker write, which the extension's
+    // polling loop picks up regardless of whether the user actually clicked
+    // (caught in 2026-05-23 live-test: terminal switched in VS Code while it
+    // was unfocused behind another app, before any click happened).
+    //
+    // Why not the custom `claude-notif://` we register in HKCU? Direct
+    // shell activation works (Start-Process invokes the handler) but the
+    // Windows toast body-click activation pipeline silently drops custom
+    // schemes for our AUMID (`Microsoft.Windows.Shell.RunDialog`). Tested
+    // 2026-05-23: both body-click and an explicit `<action
+    // activationType="protocol">` button were no-ops. The vscode:// route
+    // goes through VS Code's published-extension URI handler instead, which
+    // is reliable.
+    const tmpScript = path.join(os.tmpdir(), `claude-notif-${Date.now()}-${process.pid}.ps1`);
+    const titleLine = aiTitle ? `    <text>${xmlEsc(aiTitle)}</text>` : '';
+    const clickMarkerJson = buildClickMarkerPayload({
       sessionId, pids, shellPid, workspaceRoot, projectDir,
       event: hookEvent, project: projectName, aiTitle
     });
-    const tmpScript = path.join(os.tmpdir(), `claude-notif-${Date.now()}-${process.pid}.ps1`);
-    const titleLine = aiTitle ? `    <text>${xmlEsc(aiTitle)}</text>` : '';
+    const clickMarkerB64 = Buffer.from(clickMarkerJson, 'utf8').toString('base64');
+    const toastLaunchUri = `vscode://dimokol.claude-notifications/click?marker=${encodeURIComponent(clickMarkerB64)}`;
     const psScriptBody = `
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
 $template = @"
-<toast activationType="protocol" launch="${xmlEsc(launchUri)}" duration="long">
+<toast activationType="protocol" launch="${xmlEsc(toastLaunchUri)}" duration="long">
   <visual><binding template="ToastGeneric">
     <text>${xmlEsc(eventInfo.title)}</text>
 ${titleLine}
@@ -462,75 +519,10 @@ try {
       // BOM so Windows PowerShell 5.1 reads the .ps1 as UTF-8 instead of
       // CP1252 — without it, the em-dash in titles becomes "â€"".
       fs.writeFileSync(tmpScript, '﻿' + psScriptBody, 'utf8');
-      // Two-path spawn:
-      //
-      //   Path A (Node ≥ 22.5):
-      //     Direct powershell.exe spawn with
-      //       windowsCreateProcessFlags: CREATE_BREAKAWAY_FROM_JOB |
-      //                                  DETACHED_PROCESS |
-      //                                  CREATE_NO_WINDOW
-      //     The BREAKAWAY flag escapes Claude Code's hook job object so
-      //     PS isn't killed when the parent's job handle closes (the
-      //     reason 3.5.1's plain detached spawn dropped the toast). The
-      //     CREATE_NO_WINDOW + DETACHED_PROCESS pair suppresses any
-      //     console-window allocation at CreateProcess time, so no PS
-      //     window EVER flashes — fixes the cosmetic regression that
-      //     cmd/start reintroduced under Git Bash.
-      //
-      //   Path B (Node < 22.5):
-      //     Fallback to the legacy cmd /c start "" /B chain. Loses the
-      //     no-flash property but preserves toast firing. Documented
-      //     compromise until our installed-Node floor catches up.
-      const supportsFlags = (() => {
-        try {
-          const [major, minor] = process.versions.node.split('.').map(n => parseInt(n, 10));
-          return major > 22 || (major === 22 && minor >= 5);
-        } catch (_) {
-          return false;
-        }
-      })();
-
-      if (supportsFlags) {
-        try {
-          const child = spawn('powershell.exe', [
-            '-NoProfile', '-NonInteractive',
-            '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-            '-File', tmpScript
-          ], {
-            detached: true,
-            stdio: 'ignore',
-            windowsHide: true,
-            windowsCreateProcessFlags: ['CREATE_BREAKAWAY_FROM_JOB', 'DETACHED_PROCESS', 'CREATE_NO_WINDOW']
-          });
-          child.unref();
-        } catch (e) {
-          // Defensive: if the job doesn't allow BREAKAWAY (Job security
-          // limits with JOB_OBJECT_LIMIT_BREAKAWAY_OK unset), CreateProcess
-          // returns ERROR_ACCESS_DENIED. Fall back to cmd/start which
-          // escapes via a different mechanism.
-          const child = spawn('cmd.exe', [
-            '/c', 'start', '""', '/B',
-            'powershell.exe',
-            '-NoProfile', '-NonInteractive',
-            '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-            '-File', tmpScript
-          ], { detached: true, stdio: 'ignore', windowsHide: true });
-          child.unref();
-        }
-      } else {
-        const child = spawn('cmd.exe', [
-          '/c', 'start', '""', '/B',
-          'powershell.exe',
-          '-NoProfile', '-NonInteractive',
-          '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-          '-File', tmpScript
-        ], {
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: true
-        });
-        child.unref();
-      }
+      const child = spawn('cmd.exe', buildHiddenPsArgv(tmpScript), {
+        detached: true, stdio: 'ignore', windowsHide: true
+      });
+      child.unref();
     } catch (_) {
       try { fs.unlinkSync(tmpScript); } catch (_) {}
     }

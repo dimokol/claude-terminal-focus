@@ -606,183 +606,6 @@ var require_process_tree = __commonJS({
   }
 });
 
-// lib/win-protocol.js
-var require_win_protocol = __commonJS({
-  "lib/win-protocol.js"(exports2, module2) {
-    var fs2 = require("fs");
-    var os2 = require("os");
-    var path2 = require("path");
-    var { spawnSync } = require("child_process");
-    var PROTOCOL_SCHEME = "claude-notif";
-    var REGISTRY_ROOT = "HKCU\\Software\\Classes\\claude-notif";
-    function buildLaunchUri(payload) {
-      const json = JSON.stringify(payload);
-      const b64 = Buffer.from(json, "utf8").toString("base64");
-      return `${PROTOCOL_SCHEME}://click?marker=${encodeURIComponent(b64)}`;
-    }
-    function parseLaunchUri(uri) {
-      if (typeof uri !== "string" || !uri.startsWith(`${PROTOCOL_SCHEME}://`)) return null;
-      const m = uri.match(/[?&]marker=([^&]+)/);
-      if (!m) return null;
-      let json;
-      try {
-        const b64 = decodeURIComponent(m[1]);
-        json = Buffer.from(b64, "base64").toString("utf8");
-        if (!json.startsWith("{")) return null;
-      } catch (_) {
-        return null;
-      }
-      try {
-        return JSON.parse(json);
-      } catch (_) {
-        return null;
-      }
-    }
-    function buildRegisterCommands({ nodeExe, launcherPath, hideVbsPath }) {
-      const shellCommand = hideVbsPath ? `wscript.exe "${hideVbsPath}" "${nodeExe}" "${launcherPath}" "%1"` : `"${nodeExe}" "${launcherPath}" "%1"`;
-      return [
-        {
-          bin: "reg.exe",
-          args: [
-            "ADD",
-            REGISTRY_ROOT,
-            "/ve",
-            "/t",
-            "REG_SZ",
-            "/d",
-            "URL:Claude Notifications Click Handler",
-            "/f"
-          ]
-        },
-        {
-          bin: "reg.exe",
-          args: [
-            "ADD",
-            REGISTRY_ROOT,
-            "/v",
-            "URL Protocol",
-            "/t",
-            "REG_SZ",
-            "/d",
-            "",
-            "/f"
-          ]
-        },
-        {
-          bin: "reg.exe",
-          args: [
-            "ADD",
-            `${REGISTRY_ROOT}\\shell\\open\\command`,
-            "/ve",
-            "/t",
-            "REG_SZ",
-            "/d",
-            shellCommand,
-            "/f"
-          ]
-        }
-      ];
-    }
-    function buildUnregisterCommand() {
-      return {
-        bin: "reg.exe",
-        args: ["DELETE", REGISTRY_ROOT, "/f"]
-      };
-    }
-    function getLauncherDir(env = process.env, home = os2.homedir()) {
-      const base = env.LOCALAPPDATA || path2.join(home, "AppData", "Local");
-      return path2.join(base, "claude-notifications");
-    }
-    function getLauncherPath(env = process.env, home = os2.homedir()) {
-      return path2.join(getLauncherDir(env, home), "win-click-handler.js");
-    }
-    function resolveNodeExe() {
-      try {
-        const out = spawnSync("where", ["node"], { encoding: "utf8", windowsHide: true });
-        if (out.status === 0 && out.stdout) {
-          const first = out.stdout.split(/\r?\n/).map((s) => s.trim()).find(Boolean);
-          if (first) return first;
-        }
-      } catch (_) {
-      }
-      return "node.exe";
-    }
-    function defaultRunReg(bin, args) {
-      return spawnSync(bin, args, { encoding: "utf8", windowsHide: true });
-    }
-    function installWinProtocol({
-      bundledLauncherPath,
-      bundledHideVbsPath,
-      launcherSource,
-      hideVbsSource,
-      nodeExe,
-      env = process.env,
-      home = os2.homedir(),
-      fsLike = fs2,
-      runRegLike = defaultRunReg
-    } = {}) {
-      const launcherDir = getLauncherDir(env, home);
-      const launcherPath = path2.join(launcherDir, "win-click-handler.js");
-      const hideVbsPath = path2.join(launcherDir, "hide.vbs");
-      const resolvedNode = nodeExe || resolveNodeExe();
-      try {
-        fsLike.mkdirSync(launcherDir, { recursive: true });
-        const source = launcherSource != null ? launcherSource : fs2.readFileSync(bundledLauncherPath, "utf8");
-        fsLike.writeFileSync(launcherPath, source);
-      } catch (e) {
-        return { ok: false, error: `write launcher: ${e.message}` };
-      }
-      let hideVbsAvailable = false;
-      try {
-        let vbsContent = hideVbsSource;
-        if (vbsContent == null && bundledHideVbsPath && fs2.existsSync(bundledHideVbsPath)) {
-          vbsContent = fs2.readFileSync(bundledHideVbsPath, "utf8");
-        }
-        if (vbsContent != null) {
-          fsLike.writeFileSync(hideVbsPath, vbsContent);
-          hideVbsAvailable = true;
-        }
-      } catch (_) {
-      }
-      const cmds = buildRegisterCommands({
-        nodeExe: resolvedNode,
-        launcherPath,
-        hideVbsPath: hideVbsAvailable ? hideVbsPath : void 0
-      });
-      for (const cmd of cmds) {
-        const res = runRegLike(cmd.bin, cmd.args);
-        if (!res || res.status !== 0) {
-          return { ok: false, error: `reg ${cmd.args[0]}: ${res && res.stderr || "unknown error"}` };
-        }
-      }
-      return { ok: true, launcherPath, hideVbsPath: hideVbsAvailable ? hideVbsPath : null, nodeExe: resolvedNode };
-    }
-    function uninstallWinProtocol({ runRegLike = defaultRunReg } = {}) {
-      const cmd = buildUnregisterCommand();
-      const res = runRegLike(cmd.bin, cmd.args);
-      if (!res) return { ok: false, error: "no result from reg.exe" };
-      if (res.status === 0) return { ok: true };
-      if (res.stderr && /unable to find the specified registry key/i.test(res.stderr)) {
-        return { ok: true };
-      }
-      return { ok: false, error: res.stderr || `exit ${res.status}` };
-    }
-    module2.exports = {
-      PROTOCOL_SCHEME,
-      REGISTRY_ROOT,
-      buildLaunchUri,
-      parseLaunchUri,
-      buildRegisterCommands,
-      buildUnregisterCommand,
-      installWinProtocol,
-      uninstallWinProtocol,
-      getLauncherDir,
-      getLauncherPath,
-      resolveNodeExe
-    };
-  }
-});
-
 // hook.js
 var fs = require("fs");
 var path = require("path");
@@ -827,6 +650,30 @@ var CONFIG_FILE = "claude-notifications-config.json";
 var DEFAULT_HANDSHAKE_MS = 1200;
 function shEsc(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+function buildHiddenPsArgv(tmpScript) {
+  const hideVbsPath = path.join(os.homedir(), "AppData", "Local", "claude-notifications", "hide.vbs");
+  const psTail = [
+    "powershell.exe",
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    tmpScript
+  ];
+  let useVbs = false;
+  try {
+    useVbs = fs.existsSync(hideVbsPath);
+  } catch (_) {
+    useVbs = false;
+  }
+  if (useVbs) {
+    return ["/c", "start", '""', "/B", "wscript.exe", hideVbsPath, ...psTail];
+  }
+  return ["/c", "start", '""', "/B", ...psTail];
 }
 function xmlEsc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
@@ -1009,7 +856,11 @@ function xmlEsc(s) {
             } catch {
               try { (New-Object System.Media.SoundPlayer '${fileToPlay.replace(/'/g, "''")}').PlaySync() } catch {}
             }`.trim();
-          const child = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", psCmd], {
+          const tmpSoundScript = path.join(os.tmpdir(), `claude-sound-${Date.now()}-${process.pid}.ps1`);
+          const soundCleanup = `
+try {} finally { Remove-Item -LiteralPath '${tmpSoundScript.replace(/'/g, "''")}' -Force -ErrorAction SilentlyContinue }`;
+          fs.writeFileSync(tmpSoundScript, "\uFEFF" + psCmd + soundCleanup, "utf8");
+          const child = spawn("cmd.exe", buildHiddenPsArgv(tmpSoundScript), {
             detached: true,
             stdio: "ignore",
             windowsHide: true
@@ -1080,8 +931,9 @@ function xmlEsc(s) {
       }
     }
   } else if (process.platform === "win32") {
-    const { buildLaunchUri } = require_win_protocol();
-    const launchUri = buildLaunchUri({
+    const tmpScript = path.join(os.tmpdir(), `claude-notif-${Date.now()}-${process.pid}.ps1`);
+    const titleLine = aiTitle ? `    <text>${xmlEsc(aiTitle)}</text>` : "";
+    const clickMarkerJson = buildClickMarkerPayload({
       sessionId,
       pids,
       shellPid,
@@ -1091,13 +943,13 @@ function xmlEsc(s) {
       project: projectName,
       aiTitle
     });
-    const tmpScript = path.join(os.tmpdir(), `claude-notif-${Date.now()}-${process.pid}.ps1`);
-    const titleLine = aiTitle ? `    <text>${xmlEsc(aiTitle)}</text>` : "";
+    const clickMarkerB64 = Buffer.from(clickMarkerJson, "utf8").toString("base64");
+    const toastLaunchUri = `vscode://dimokol.claude-notifications/click?marker=${encodeURIComponent(clickMarkerB64)}`;
     const psScriptBody = `
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
 $template = @"
-<toast activationType="protocol" launch="${xmlEsc(launchUri)}" duration="long">
+<toast activationType="protocol" launch="${xmlEsc(toastLaunchUri)}" duration="long">
   <visual><binding template="ToastGeneric">
     <text>${xmlEsc(eventInfo.title)}</text>
 ${titleLine}
@@ -1118,72 +970,12 @@ try {
 `;
     try {
       fs.writeFileSync(tmpScript, "\uFEFF" + psScriptBody, "utf8");
-      const supportsFlags = (() => {
-        try {
-          const [major, minor] = process.versions.node.split(".").map((n) => parseInt(n, 10));
-          return major > 22 || major === 22 && minor >= 5;
-        } catch (_) {
-          return false;
-        }
-      })();
-      if (supportsFlags) {
-        try {
-          const child = spawn("powershell.exe", [
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            tmpScript
-          ], {
-            detached: true,
-            stdio: "ignore",
-            windowsHide: true,
-            windowsCreateProcessFlags: ["CREATE_BREAKAWAY_FROM_JOB", "DETACHED_PROCESS", "CREATE_NO_WINDOW"]
-          });
-          child.unref();
-        } catch (e) {
-          const child = spawn("cmd.exe", [
-            "/c",
-            "start",
-            '""',
-            "/B",
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            tmpScript
-          ], { detached: true, stdio: "ignore", windowsHide: true });
-          child.unref();
-        }
-      } else {
-        const child = spawn("cmd.exe", [
-          "/c",
-          "start",
-          '""',
-          "/B",
-          "powershell.exe",
-          "-NoProfile",
-          "-NonInteractive",
-          "-WindowStyle",
-          "Hidden",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-File",
-          tmpScript
-        ], {
-          detached: true,
-          stdio: "ignore",
-          windowsHide: true
-        });
-        child.unref();
-      }
+      const child = spawn("cmd.exe", buildHiddenPsArgv(tmpScript), {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true
+      });
+      child.unref();
     } catch (_) {
       try {
         fs.unlinkSync(tmpScript);
