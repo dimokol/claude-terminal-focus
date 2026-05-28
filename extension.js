@@ -202,6 +202,8 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
       if (e.affectsConfiguration('claudeNotifications')) {
         syncSettingsToConfig(context.extensionPath, log);
         updateStatusBar(statusBarItem, context.extensionPath);
+      }
+      if (e.affectsConfiguration('claudeNotifications.windows.forceForeground')) {
         applyForceForeground(context, log);
       }
     })
@@ -458,7 +460,7 @@ async function handleVsCodeUriClick(uri, log) {
 const FLT_ORIGINAL_KEY = 'cn.flt.original';
 const FLT_PROMPTED_KEY = 'cn.flt.prompted';
 
-function applyForceForeground(context, log) {
+async function applyForceForeground(context, log) {
   if (process.platform !== 'win32') return;
   const enabled = vscode.workspace.getConfiguration('claudeNotifications')
     .get('windows.forceForeground', false);
@@ -466,7 +468,7 @@ function applyForceForeground(context, log) {
   if (enabled) {
     if (current === 0) return; // already 0
     if (context.globalState.get(FLT_ORIGINAL_KEY) == null && current != null) {
-      context.globalState.update(FLT_ORIGINAL_KEY, current);
+      await context.globalState.update(FLT_ORIGINAL_KEY, current);
     }
     const r = winForegroundLock.setForegroundLockTimeout(0);
     log.appendLine(`forceForeground: set ForegroundLockTimeout=0 (was ${current}) ok=${r.ok}${r.error ? ' err=' + r.error : ''}`);
@@ -474,8 +476,9 @@ function applyForceForeground(context, log) {
     const orig = context.globalState.get(FLT_ORIGINAL_KEY);
     if (orig != null && current === 0) {
       const r = winForegroundLock.setForegroundLockTimeout(orig);
-      log.appendLine(`forceForeground: restored ForegroundLockTimeout=${orig} ok=${r.ok}`);
-      context.globalState.update(FLT_ORIGINAL_KEY, undefined);
+      log.appendLine(`forceForeground: restored ForegroundLockTimeout=${orig} ok=${r.ok}${r.error ? ' err=' + r.error : ''}`);
+      // undefined is VS Code's documented "remove key" sentinel.
+      await context.globalState.update(FLT_ORIGINAL_KEY, undefined);
     }
   }
 }
@@ -496,7 +499,7 @@ async function maybePromptForceForeground(context, log) {
   );
   if (choice === 'Enable instant focus') {
     await cfg.update('windows.forceForeground', true, vscode.ConfigurationTarget.Global);
-    applyForceForeground(context, log); // config-change handler also fires; idempotent
+    await applyForceForeground(context, log); // config-change handler also fires; idempotent
     vscode.window.showInformationMessage('Claude Notifications: instant focus enabled. Turn it off anytime in Settings — your previous Windows value is restored.');
   }
 }
