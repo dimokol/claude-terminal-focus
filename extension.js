@@ -29,7 +29,6 @@ const { parseClickMarker } = require('./lib/click-marker');
 const { matchTerminal } = require('./lib/terminal-match');
 const { checkHookStatus, checkAllProfiles, installHooks, uninstallHooks, discoverProfiles } = require('./lib/hooks-installer');
 const { installHookRuntime, uninstallHookRuntime, getWrapperHookPath, getWrapperUserPromptPath } = require('./lib/hook-runtime');
-const winForegroundLock = require('./lib/win-foreground-lock');
 
 let _wrapperPaths = null;
 function getWrapperPaths() {
@@ -97,7 +96,6 @@ function activate(context) {
     } catch (e) {
       log.appendLine(`Windows click-handler registration threw: ${e.message}`);
     }
-    applyForceForeground(context, log);
   }
 
   // --- Status bar ---
@@ -192,7 +190,6 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
   // --- Auto-fix stale hook paths, then first-run checks (sequential) ---
   autoFixAllProfiles(context, log).then(() => {
     runFirstRunChecks(context, log, statusBarItem);
-    maybePromptForceForeground(context, log);
   });
 
   // --- Settings sync: VS Code settings → shared config file for hook.js ---
@@ -202,9 +199,6 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
       if (e.affectsConfiguration('claudeNotifications')) {
         syncSettingsToConfig(context.extensionPath, log);
         updateStatusBar(statusBarItem, context.extensionPath);
-      }
-      if (e.affectsConfiguration('claudeNotifications.windows.forceForeground')) {
-        applyForceForeground(context, log);
       }
     })
   );
@@ -416,92 +410,13 @@ async function handleVsCodeUriClick(uri, log) {
   log.appendLine(`Click-to-focus [uri] — event=${target.event}, session=${sessionTag}, project=${target.project}, pids=[${target.pids.join(',')}]${titleSuffix}`);
   await focusMatchingTerminal(target, log);
   if (workspaceRoot && target.sessionId) markResolved(workspaceRoot, target.sessionId);
-
-  // Windows-only: bring VS Code's main window to the foreground over
-  // whatever fullscreen app the user is currently looking at. VS Code's
-  // built-in URI handler doesn't auto-foreground (Windows focus-stealing
-  // restriction — extension host receives the URI in the background and
-  // doesn't have foreground rights). We delegate to lib/win-focus.js which
-  // runs a PowerShell helper that uses the AttachThreadInput trick to
-  // temporarily inherit the current foreground thread's input privilege,
-  // then BringWindowToTop + SetForegroundWindow on VS Code.
-  if (process.platform === 'win32') {
-    try {
-      const { snapshot } = require('./lib/process-tree');
-      const { resolveCodeInstancePids } = require('./lib/code-instance-resolver');
-      const { focusHwndByPidAsync } = require('./lib/win-focus');
-      const snap = snapshot();
-      if (snap && snap.procs && Array.isArray(target.pids) && target.pids.length > 0) {
-        // All Code.exe ancestors, not just the shortest-walk one. The
-        // shortest is the terminal's ptyHost (no window); the renderer that
-        // owns the window is a further-up Code.exe. The PS helper picks the
-        // one that actually owns a top-level visible window.
-        const codePids = resolveCodeInstancePids(target.pids, snap);
-        if (codePids.length > 0) {
-          log.appendLine(`URI click: foregrounding Code.exe candidates [${codePids.join(',')}]`);
-          focusHwndByPidAsync(codePids);
-        } else {
-          log.appendLine('URI click: no Code.exe ancestor resolved from marker pids — taskbar will flash only');
-        }
-      }
-    } catch (e) {
-      log.appendLine(`URI click: foreground-steal failed — ${e.message}`);
-    }
-  }
-}
-
-// --- Windows foreground-lock opt-in (forceForeground) ---
-//
-// While HKCU ForegroundLockTimeout is non-zero, Windows blocks our
-// background banner-click handler from raising VS Code over other apps
-// (taskbar flash only). When the user opts into forceForeground we set it
-// to 0 (saving their original first) and restore on opt-out / uninstall.
-
-const FLT_ORIGINAL_KEY = 'cn.flt.original';
-const FLT_PROMPTED_KEY = 'cn.flt.prompted';
-
-async function applyForceForeground(context, log) {
-  if (process.platform !== 'win32') return;
-  const enabled = vscode.workspace.getConfiguration('claudeNotifications')
-    .get('windows.forceForeground', false);
-  const current = winForegroundLock.getForegroundLockTimeout();
-  if (enabled) {
-    if (current === 0) return; // already 0
-    if (context.globalState.get(FLT_ORIGINAL_KEY) == null && current != null) {
-      await context.globalState.update(FLT_ORIGINAL_KEY, current);
-    }
-    const r = winForegroundLock.setForegroundLockTimeout(0);
-    log.appendLine(`forceForeground: set ForegroundLockTimeout=0 (was ${current}) ok=${r.ok}${r.error ? ' err=' + r.error : ''}`);
-  } else {
-    const orig = context.globalState.get(FLT_ORIGINAL_KEY);
-    if (orig != null && current === 0) {
-      const r = winForegroundLock.setForegroundLockTimeout(orig);
-      log.appendLine(`forceForeground: restored ForegroundLockTimeout=${orig} ok=${r.ok}${r.error ? ' err=' + r.error : ''}`);
-      // undefined is VS Code's documented "remove key" sentinel.
-      await context.globalState.update(FLT_ORIGINAL_KEY, undefined);
-    }
-  }
-}
-
-async function maybePromptForceForeground(context, log) {
-  if (process.platform !== 'win32') return;
-  if (context.globalState.get(FLT_PROMPTED_KEY)) return;
-  const cfg = vscode.workspace.getConfiguration('claudeNotifications');
-  if (cfg.get('windows.forceForeground', false)) return; // already on
-  const current = winForegroundLock.getForegroundLockTimeout();
-  if (current === 0) return; // nothing to gain — focus-steal already works
-  context.globalState.update(FLT_PROMPTED_KEY, true);
-  const choice = await vscode.window.showInformationMessage(
-    'Claude Notifications: want notification clicks to bring VS Code to the front automatically? ' +
-    'Right now Windows only flashes it in the taskbar. Enabling this flips one safe, instantly-reversible ' +
-    'Windows setting (ForegroundLockTimeout → 0) so VS Code can raise itself when you click a notification.',
-    'Enable instant focus', 'Keep taskbar flash'
-  );
-  if (choice === 'Enable instant focus') {
-    await cfg.update('windows.forceForeground', true, vscode.ConfigurationTarget.Global);
-    await applyForceForeground(context, log); // config-change handler also fires; idempotent
-    vscode.window.showInformationMessage('Claude Notifications: instant focus enabled. Turn it off anytime in Settings — your previous Windows value is restored.');
-  }
+  // NOTE: We deliberately do NOT try to bring VS Code's window to the
+  // foreground here. On Windows, a toast click runs with ShellExperienceHost
+  // as the foreground window, which the OS shields — no SetForegroundWindow /
+  // AttachThreadInput / keystroke trick can raise a window over it from a
+  // background process (documented MS limitation; see
+  // docs/windows-banner-focus-handoff.md for the full investigation). The
+  // taskbar flashes; clicking it brings VS Code up already on the right tab.
 }
 
 /**
@@ -949,20 +864,6 @@ async function cmdUninstall(context, log) {
     log.appendLine(`Uninstall: state dir removal failed — ${e.message}`);
   }
 
-  // Restore the user's original ForegroundLockTimeout if we changed it.
-  if (process.platform === 'win32') {
-    try {
-      const orig = context.globalState.get(FLT_ORIGINAL_KEY);
-      if (orig != null) {
-        winForegroundLock.setForegroundLockTimeout(orig);
-        context.globalState.update(FLT_ORIGINAL_KEY, undefined);
-        log.appendLine(`Uninstall: restored ForegroundLockTimeout=${orig}`);
-      }
-    } catch (e) {
-      log.appendLine(`Uninstall: FLT restore failed — ${e.message}`);
-    }
-  }
-
   vscode.window.showInformationMessage(
     'Claude Notifications: cleanup complete. You can now safely uninstall the extension from the Extensions view.'
   );
@@ -1067,7 +968,7 @@ async function autoFixAllProfiles(context, log) {
 
   const wrapper = getWrapperPaths();
   const results = checkAllProfiles(wrapper.hookPath);
-  const needsFix = results.filter(r => r.status === 'stale-path' || r.status === 'partial');
+  const needsFix = results.filter(r => r.status === 'stale-path' || r.status === 'partial' || r.status === 'stale-config');
 
   if (needsFix.length === 0) return;
 
@@ -1088,8 +989,8 @@ async function autoFixAllProfiles(context, log) {
     log.appendLine(`Auto-fixed hook paths in ${fixed.length} profile(s): ${fixed.join(', ')}`);
     updateStatusBar(_statusBarItem, context.extensionPath);
     const summary = fixed.length === 1
-      ? `Claude Notifications: updated stale hook paths in ${path.basename(path.dirname(fixed[0]))}/settings.json.`
-      : `Claude Notifications: updated stale hook paths in ${fixed.length} Claude profiles. Restart any active 'claude' sessions for the change to take effect.`;
+      ? `Claude Notifications: updated hook configuration in ${path.basename(path.dirname(fixed[0]))}/settings.json. Restart any active 'claude' sessions for the change to take effect.`
+      : `Claude Notifications: updated hook configuration in ${fixed.length} Claude profiles. Restart any active 'claude' sessions for the change to take effect.`;
     vscode.window.showInformationMessage(summary);
   }
 
@@ -1117,7 +1018,9 @@ async function runFirstRunChecks(context, log, statusBarItem) {
   const { status } = checkHookStatus(wrapper.hookPath);
   log.appendLine(`Hook status: ${status}`);
 
-  if (status === 'installed' || status === 'stale-path') return;
+  // 'stale-path' and 'stale-config' are repaired by autoFixAllProfiles (which
+  // runs first); nothing more to do here for them.
+  if (status === 'installed' || status === 'stale-path' || status === 'stale-config') return;
 
   const config = vscode.workspace.getConfiguration('claudeNotifications');
   const autoSetup = config.get('autoSetupHooks', true);

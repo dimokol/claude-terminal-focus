@@ -84,13 +84,14 @@ const LEGACY_3_4 = '/home/u/.vscode/extensions/dimokol.claude-notifications-3.4.
 const LEGACY_3_3 = '/home/u/.vscode/extensions/dimokol.claude-notifications-3.3.2/dist/hook.js';
 
 function buildWrapperSettings({ includeUserPrompt = true } = {}) {
-  const entry = (c) => ({ matcher: '', hooks: [{ type: 'command', command: c }] });
+  // Notification hooks carry async:true (current valid install shape).
+  const entry = (c, extra = {}) => ({ matcher: '', hooks: [{ type: 'command', command: c, ...extra }] });
   const cmd = `node "${WRAPPER_HOOK}"`;
   const userPromptCmd = `node "${WRAPPER_USER_PROMPT}"`;
   const hooks = {
-    Stop: [entry(cmd)],
-    Notification: [entry(cmd)],
-    PermissionRequest: [entry(cmd)]
+    Stop: [entry(cmd, { async: true })],
+    Notification: [entry(cmd, { async: true })],
+    PermissionRequest: [entry(cmd, { async: true })]
   };
   if (includeUserPrompt) hooks.UserPromptSubmit = [entry(userPromptCmd)];
   return { hooks };
@@ -116,8 +117,9 @@ test('checkAllProfiles returns one entry per discovered profile', () => {
   const results = checkAllProfiles(WRAPPER_HOOK, home);
   assert.strictEqual(results.length, 2);
 
-  const def = results.find(r => r.path.endsWith('/.claude/settings.json'));
-  const other = results.find(r => r.path.endsWith('/.claude-other/settings.json'));
+  const normalize = p => p.replace(/\\/g, '/');
+  const def = results.find(r => normalize(r.path).endsWith('/.claude/settings.json'));
+  const other = results.find(r => normalize(r.path).endsWith('/.claude-other/settings.json'));
   assert.strictEqual(def.status, 'installed');
   // Legacy 3.3 entry → stale-path (still ours, but pointing somewhere else)
   assert.strictEqual(other.status, 'stale-path');
@@ -286,6 +288,94 @@ test('checkHookStatus detects legacy double-backslash entries as ours (not "not-
   // must NOT be 'not-installed' — that's the bug we're guarding against.
   assert.notStrictEqual(status.status, 'not-installed',
     `pre-fix this returned 'not-installed', causing duplicate-entry append. Got '${status.status}'.`);
+});
+
+test('checkHookStatus reports stale-config when our hooks are at the correct path but lack async', () => {
+  // The state of every 3.5.x install made BEFORE the async change: hooks
+  // point at the correct wrapper path (so it's not stale-path), all events
+  // present (so it's not partial), but the notification entries have no
+  // async flag. checkHookStatus must flag this so activation rewrites them —
+  // otherwise the async feature never reaches already-installed users.
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  const entry = (c) => ({ matcher: '', hooks: [{ type: 'command', command: c }] });
+  const cmd = `node "${WRAPPER_HOOK}"`;
+  const upCmd = `node "${WRAPPER_USER_PROMPT}"`;
+  writeSettings(settingsPath, { hooks: {
+    Stop: [entry(cmd)],
+    Notification: [entry(cmd)],
+    PermissionRequest: [entry(cmd)],
+    UserPromptSubmit: [entry(upCmd)]
+  }});
+
+  const status = checkHookStatus(WRAPPER_HOOK, settingsPath);
+  assert.strictEqual(status.status, 'stale-config',
+    `expected 'stale-config' for a correct-path install missing async, got '${status.status}'`);
+});
+
+test('checkHookStatus reports installed when our hooks have async at the correct path', () => {
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  writeSettings(settingsPath, buildWrapperSettings());
+
+  const status = checkHookStatus(WRAPPER_HOOK, settingsPath);
+  assert.strictEqual(status.status, 'installed',
+    `expected 'installed' for a correct-path async install, got '${status.status}'`);
+});
+
+test('installHooks output round-trips to installed (async-aware checkHookStatus)', () => {
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  const wrapper = {
+    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+  };
+  installHooks(wrapper, { settingsPath });
+  const status = checkHookStatus(wrapper.hookPath, settingsPath);
+  assert.strictEqual(status.status, 'installed',
+    `installHooks should produce an async config that checkHookStatus accepts as installed, got '${status.status}'`);
+});
+
+test('installHooks marks the notification hooks async (fire-and-forget)', () => {
+  // async:true tells Claude Code to fire the hook and not wait for it to
+  // exit, so the turn completes without the ~1.2s handshake block (issue #2).
+  // The hook still runs its full handshake/claim/notify in the background.
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+
+  const wrapper = {
+    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+  };
+  const r = installHooks(wrapper, { settingsPath });
+  assert.strictEqual(r.success, true, r.message);
+
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  for (const event of ['Stop', 'Notification', 'PermissionRequest']) {
+    const hook = settings.hooks[event][0].hooks[0];
+    assert.strictEqual(hook.async, true, `${event} hook should be async`);
+  }
+});
+
+test('installHooks does NOT mark UserPromptSubmit async', () => {
+  // UserPromptSubmit only advances the stageId synchronously (no handshake
+  // sleep), so async buys nothing and synchronous ordering keeps the
+  // stage-advance happens-before relative to the next Stop clean.
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+
+  const wrapper = {
+    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+  };
+  installHooks(wrapper, { settingsPath });
+
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  const hook = settings.hooks.UserPromptSubmit[0].hooks[0];
+  assert.notStrictEqual(hook.async, true, 'UserPromptSubmit hook should not be async');
 });
 
 test('installHooks is idempotent on POSIX paths (no duplicate accumulation)', () => {
