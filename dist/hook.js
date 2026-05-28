@@ -290,7 +290,7 @@ var require_stage_dedup = __commonJS({
         }
         if (entry.resolved === true) {
           const lastAt2 = entry.lastNotifiedAt || 0;
-          if (now - lastAt2 < STAGE_ESCAPE_VALVE_MS) {
+          if (now - lastAt2 < STAGE_ESCAPE_VALVE_MS || currentHookEventName === "Notification") {
             entry.lastEvent = currentEvent;
             entry.lastHookEventName = currentHookEventName || entry.lastHookEventName || null;
             entry.updatedAt = now;
@@ -307,7 +307,7 @@ var require_stage_dedup = __commonJS({
           return { notify: true, stageId: entry.stageId };
         }
         const lastAt = entry.lastNotifiedAt || 0;
-        if (now - lastAt > STAGE_ESCAPE_VALVE_MS) {
+        if (now - lastAt > STAGE_ESCAPE_VALVE_MS && currentHookEventName !== "Notification") {
           entry.stageId = (entry.stageId || 0) + 1;
           entry.lastEvent = currentEvent;
           entry.lastHookEventName = currentHookEventName || null;
@@ -606,6 +606,58 @@ var require_process_tree = __commonJS({
   }
 });
 
+// lib/code-build.js
+var require_code_build = __commonJS({
+  "lib/code-build.js"(exports2, module2) {
+    "use strict";
+    var BUILDS = [
+      { id: "insiders", re: /^Code - Insiders\.exe$/i, scheme: "vscode-insiders", cli: "code-insiders" },
+      { id: "stable", re: /^Code\.exe$/i, scheme: "vscode", cli: "code" },
+      { id: "vscodium", re: /^(VSCodium|Codium)\.exe$/i, scheme: "vscodium", cli: "codium" },
+      { id: "cursor", re: /^Cursor\.exe$/i, scheme: "cursor", cli: "cursor" },
+      { id: "windsurf", re: /^Windsurf\.exe$/i, scheme: "windsurf", cli: "windsurf" }
+    ];
+    var CLI_PREFERENCE = ["code", "code-insiders", "codium", "cursor", "windsurf"];
+    function buildFor(name) {
+      if (typeof name !== "string" || name === "") return null;
+      const base = name.replace(/^.*[/\\]/, "");
+      return BUILDS.find((b) => b.re.test(base)) || null;
+    }
+    function classifyBuild2(name) {
+      const b = buildFor(name);
+      return b ? b.id : null;
+    }
+    function schemeForBinaryName2(binaryName, fallback = "vscode") {
+      const b = buildFor(binaryName);
+      return b ? b.scheme : fallback;
+    }
+    function cliForBinaryName(binaryName) {
+      const b = buildFor(binaryName);
+      return b ? b.cli : null;
+    }
+    function resolveCodeCli({ binaryName, probe, fallback = "code" } = {}) {
+      const mapped = cliForBinaryName(binaryName);
+      if (mapped) {
+        if (typeof probe !== "function" || probe(mapped)) return mapped;
+      }
+      if (typeof probe === "function") {
+        for (const cli of CLI_PREFERENCE) {
+          if (probe(cli)) return cli;
+        }
+      }
+      return fallback;
+    }
+    module2.exports = {
+      BUILDS,
+      CLI_PREFERENCE,
+      classifyBuild: classifyBuild2,
+      schemeForBinaryName: schemeForBinaryName2,
+      cliForBinaryName,
+      resolveCodeCli
+    };
+  }
+});
+
 // hook.js
 var fs = require("fs");
 var path = require("path");
@@ -624,6 +676,7 @@ var { shouldNotify: checkShouldNotify } = require_stage_dedup();
 var { buildClickMarkerPayload } = require_click_marker();
 var { readAiTitle } = require_transcript_title();
 var { snapshot: processSnapshot, walkUp } = require_process_tree();
+var { schemeForBinaryName, classifyBuild } = require_code_build();
 var SHELL_PROCESS_NAMES = /* @__PURE__ */ new Set([
   "bash.exe",
   "sh.exe",
@@ -945,7 +998,14 @@ try {} finally { Remove-Item -LiteralPath '${tmpSoundScript.replace(/'/g, "''")}
       aiTitle
     });
     const clickMarkerB64 = Buffer.from(clickMarkerJson, "utf8").toString("base64");
-    const toastLaunchUri = `vscode://dimokol.claude-notifications/click?marker=${encodeURIComponent(clickMarkerB64)}`;
+    let launchScheme = "vscode";
+    for (const node of chain) {
+      if (node && node.name && classifyBuild(node.name)) {
+        launchScheme = schemeForBinaryName(node.name);
+        break;
+      }
+    }
+    const toastLaunchUri = `${launchScheme}://dimokol.claude-notifications/click?marker=${encodeURIComponent(clickMarkerB64)}`;
     const psScriptBody = `
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null

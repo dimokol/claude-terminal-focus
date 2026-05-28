@@ -507,7 +507,22 @@ public class CN_Win32 {
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+  // SendInput (not the legacy keybd_event) is the call Chromium/Electron use
+  // to satisfy SetForegroundWindow's "received the last input event" rule.
+  [StructLayout(LayoutKind.Sequential)]
+  public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Explicit)]
+  public struct INPUTUNION { [FieldOffset(0)] public KEYBDINPUT ki; }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct INPUT { public uint type; public INPUTUNION u; }
+  [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint n, INPUT[] inp, int cb);
+  public static void TapAlt() {
+    INPUT[] inp = new INPUT[2];
+    inp[0].type = 1; inp[0].u.ki.wVk = 0x12;                 // VK_MENU down
+    inp[1].type = 1; inp[1].u.ki.wVk = 0x12; inp[1].u.ki.dwFlags = 0x0002; // VK_MENU up (KEYEVENTF_KEYUP)
+    SendInput(2, inp, Marshal.SizeOf(typeof(INPUT)));
+  }
 }
 "@
 
@@ -537,13 +552,16 @@ if ($found -eq [IntPtr]::Zero) {
 $currentThread = [CN_Win32]::GetCurrentThreadId()
 $ok = $false
 
-# Retry across the post-toast-click foreground settling window. When the
-# extension host spawns us right after the user clicks the toast, the
-# foreground window can briefly be the toast host / a transient window;
-# AttachThreadInput to that wrong thread fails to raise VS Code. Re-reading
-# the foreground each attempt and retrying over ~1.5s catches the settled
-# state.
-for ($i = 0; $i -lt 6 -and -not $ok; $i++) {
+# Retry while the foreground settles, re-reading it each pass, then SendInput
+# Alt-tap + SetForegroundWindow. $ok is verified against GetForegroundWindow,
+# not the (unreliable) SetForegroundWindow return value.
+#
+# NOTE: this helper currently has NO caller in the toast-click path \u2014 the
+# OS-banner-click foreground raise was investigated exhaustively and shown to
+# be blocked by ShellExperienceHost (and gated by ForegroundLockTimeout); see
+# docs/windows-banner-focus-handoff.md. It is retained, proven-correct in
+# non-toast contexts, for bin/win-click-handler.js and any future attempt.
+for ($i = 0; $i -lt 20 -and -not $ok; $i++) {
   [CN_Win32]::AllowSetForegroundWindow($foundPid) | Out-Null
   $fgHwnd = [CN_Win32]::GetForegroundWindow()
   $fgPid = [uint32]0
@@ -554,19 +572,15 @@ for ($i = 0; $i -lt 6 -and -not $ok; $i++) {
   }
   try {
     if ([CN_Win32]::IsIconic($found)) { [CN_Win32]::ShowWindow($found, 9) | Out-Null }
-    # Alt-key tap: synthesizing an Alt down/up gives our thread a "recent
-    # user input" event, which satisfies one of SetForegroundWindow's
-    # allow-conditions. This is the only thing that works when the
-    # foreground is "Action center" (the toast host) \u2014 AttachThreadInput
-    # to that protected UWP surface fails, but the Alt tap doesn't need it.
-    [CN_Win32]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-    [CN_Win32]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+    [CN_Win32]::TapAlt()
     [CN_Win32]::BringWindowToTop($found) | Out-Null
-    $ok = [CN_Win32]::SetForegroundWindow($found)
+    [CN_Win32]::SetForegroundWindow($found) | Out-Null
   } finally {
     if ($attached) { [CN_Win32]::AttachThreadInput($currentThread, $fgThread, $false) | Out-Null }
   }
-  if (-not $ok) { Start-Sleep -Milliseconds 150 }
+  Start-Sleep -Milliseconds 40
+  $ok = ([CN_Win32]::GetForegroundWindow() -eq $found)
+  if (-not $ok) { Start-Sleep -Milliseconds 110 }
 }
 
 if (-not $ok) {

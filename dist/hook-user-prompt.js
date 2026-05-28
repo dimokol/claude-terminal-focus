@@ -181,7 +181,7 @@ var require_stage_dedup = __commonJS({
         }
         if (entry.resolved === true) {
           const lastAt2 = entry.lastNotifiedAt || 0;
-          if (now - lastAt2 < STAGE_ESCAPE_VALVE_MS) {
+          if (now - lastAt2 < STAGE_ESCAPE_VALVE_MS || currentHookEventName === "Notification") {
             entry.lastEvent = currentEvent;
             entry.lastHookEventName = currentHookEventName || entry.lastHookEventName || null;
             entry.updatedAt = now;
@@ -198,7 +198,7 @@ var require_stage_dedup = __commonJS({
           return { notify: true, stageId: entry.stageId };
         }
         const lastAt = entry.lastNotifiedAt || 0;
-        if (now - lastAt > STAGE_ESCAPE_VALVE_MS) {
+        if (now - lastAt > STAGE_ESCAPE_VALVE_MS && currentHookEventName !== "Notification") {
           entry.stageId = (entry.stageId || 0) + 1;
           entry.lastEvent = currentEvent;
           entry.lastHookEventName = currentHookEventName || null;

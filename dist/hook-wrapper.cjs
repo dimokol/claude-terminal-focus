@@ -83,6 +83,10 @@ function selfDestruct({ home = os.homedir(), wrapperDir = __dirname } = {}) {
       stripFromSettings(sp, SELF_IDENTIFIERS);
     } catch (_) {
     }
+    try {
+      fs.rmSync(sp + ".backup", { force: true });
+    } catch (_) {
+    }
   }
   try {
     fs.rmSync(path.join(home, ".claude", "focus-state"), { recursive: true, force: true });
