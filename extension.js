@@ -27,8 +27,9 @@ const {
 const { markResolved } = require('./lib/stage-dedup');
 const { parseClickMarker } = require('./lib/click-marker');
 const { matchTerminal } = require('./lib/terminal-match');
-const { checkHookStatus, checkAllProfiles, installHooks, uninstallHooks } = require('./lib/hooks-installer');
+const { checkHookStatus, checkAllProfiles, installHooks, uninstallHooks, discoverProfiles } = require('./lib/hooks-installer');
 const { installHookRuntime, uninstallHookRuntime, getWrapperHookPath, getWrapperUserPromptPath } = require('./lib/hook-runtime');
+const winForegroundLock = require('./lib/win-foreground-lock');
 
 let _wrapperPaths = null;
 function getWrapperPaths() {
@@ -96,6 +97,7 @@ function activate(context) {
     } catch (e) {
       log.appendLine(`Windows click-handler registration threw: ${e.message}`);
     }
+    applyForceForeground(context, log);
   }
 
   // --- Status bar ---
@@ -122,7 +124,25 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
     vscode.commands.registerCommand('claudeNotifications.chooseSound', (event) => cmdChooseSound(context, log, event)),
     vscode.commands.registerCommand('claudeNotifications.previewSound', () => cmdPreviewSound(context, log)),
     vscode.commands.registerCommand('claudeNotifications.setupMacNotifier', () => cmdSetupMacNotifier(context, log)),
-    vscode.commands.registerCommand('claudeNotifications.uninstall', () => cmdUninstall(log))
+    vscode.commands.registerCommand('claudeNotifications.uninstall', () => cmdUninstall(context, log))
+  );
+
+  // --- VS Code URI handler for OS-banner clicks (Windows + cross-platform) ---
+  //
+  // The Windows toast's `launch="vscode://dimokol.claude-notifications/click?marker=<b64>"`
+  // routes here when the user clicks. We get the click event in-extension —
+  // no marker file mediation, no race between preemptive write and polling
+  // loop pickup. This replaces the file-based clicked-marker approach on
+  // Windows (where the custom `claude-notif://` scheme silently fails to
+  // activate from toasts with our AUMID) AND avoids the side effect of the
+  // extension processing a preemptive marker before the user actually
+  // clicks (e.g. terminal switching unexpectedly while VS Code is in the
+  // background). macOS continues to use terminal-notifier's `-execute`
+  // marker write, which is its native click delivery mechanism.
+  context.subscriptions.push(
+    vscode.window.registerUriHandler({
+      handleUri: (uri) => handleVsCodeUriClick(uri, log)
+    })
   );
 
   // --- Signal file watcher (polling at 400ms) ---
@@ -172,6 +192,7 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
   // --- Auto-fix stale hook paths, then first-run checks (sequential) ---
   autoFixAllProfiles(context, log).then(() => {
     runFirstRunChecks(context, log, statusBarItem);
+    maybePromptForceForeground(context, log);
   });
 
   // --- Settings sync: VS Code settings → shared config file for hook.js ---
@@ -181,6 +202,7 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
       if (e.affectsConfiguration('claudeNotifications')) {
         syncSettingsToConfig(context.extensionPath, log);
         updateStatusBar(statusBarItem, context.extensionPath);
+        applyForceForeground(context, log);
       }
     })
   );
@@ -331,6 +353,151 @@ async function handleSignal(signalPath, workspaceRoot, log) {
       await focusMatchingTerminal(signal, log);
       markResolved(workspaceRoot, signal.sessionId);
     }
+  }
+}
+
+/**
+ * Handle a vscode://dimokol.claude-notifications/click?marker=<b64> URI
+ * activation. The Windows toast's launch attribute routes through here on
+ * banner click — no file mediation, just the marker payload in the URI.
+ *
+ * Mirrors handleClickedSignal's marker-driven branch (decode → build target
+ * → focusMatchingTerminal → markResolved) but takes the marker straight
+ * from the query string instead of reading the clicked file.
+ */
+async function handleVsCodeUriClick(uri, log) {
+  let markerB64 = '';
+  try {
+    const q = (uri.query || '').split('&').find(p => p.startsWith('marker='));
+    if (q) markerB64 = decodeURIComponent(q.slice('marker='.length));
+  } catch (_) {}
+  if (!markerB64) {
+    log.appendLine('URI click: no marker query param — ignoring');
+    return;
+  }
+  let payload;
+  try {
+    const json = Buffer.from(markerB64, 'base64').toString('utf8');
+    payload = JSON.parse(json);
+  } catch (e) {
+    log.appendLine(`URI click: marker decode failed — ${e.message}`);
+    return;
+  }
+  if (!payload || !Array.isArray(payload.pids) || payload.pids.length === 0) {
+    log.appendLine('URI click: marker missing pids — cannot match terminal');
+    return;
+  }
+
+  const target = {
+    sessionId: payload.sessionId || '',
+    pids: payload.pids,
+    shellPid: payload.shellPid || 0,
+    workspaceRoot: payload.workspaceRoot || '',
+    projectDir: payload.projectDir || '',
+    event: payload.event || 'waiting',
+    project: payload.project || 'Claude Code',
+    aiTitle: payload.aiTitle || '',
+    source: 'uri'
+  };
+
+  // Resolve workspace root for marker cleanup paths (best effort).
+  const workspaceRoot = target.workspaceRoot ||
+    (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0]?.uri.fsPath) || '';
+  if (workspaceRoot) {
+    try { fs.unlinkSync(getClickedPath(workspaceRoot)); } catch (_) {}
+    try { fs.unlinkSync(getSignalPath(workspaceRoot)); } catch (_) {}
+    try { fs.unlinkSync(getClaimedPath(workspaceRoot)); } catch (_) {}
+  }
+
+  const sessionTag = target.sessionId ? target.sessionId.slice(0, 8) : '?';
+  const titleSuffix = target.aiTitle ? `, title="${target.aiTitle}"` : '';
+  log.appendLine(`Click-to-focus [uri] — event=${target.event}, session=${sessionTag}, project=${target.project}, pids=[${target.pids.join(',')}]${titleSuffix}`);
+  await focusMatchingTerminal(target, log);
+  if (workspaceRoot && target.sessionId) markResolved(workspaceRoot, target.sessionId);
+
+  // Windows-only: bring VS Code's main window to the foreground over
+  // whatever fullscreen app the user is currently looking at. VS Code's
+  // built-in URI handler doesn't auto-foreground (Windows focus-stealing
+  // restriction — extension host receives the URI in the background and
+  // doesn't have foreground rights). We delegate to lib/win-focus.js which
+  // runs a PowerShell helper that uses the AttachThreadInput trick to
+  // temporarily inherit the current foreground thread's input privilege,
+  // then BringWindowToTop + SetForegroundWindow on VS Code.
+  if (process.platform === 'win32') {
+    try {
+      const { snapshot } = require('./lib/process-tree');
+      const { resolveCodeInstancePids } = require('./lib/code-instance-resolver');
+      const { focusHwndByPidAsync } = require('./lib/win-focus');
+      const snap = snapshot();
+      if (snap && snap.procs && Array.isArray(target.pids) && target.pids.length > 0) {
+        // All Code.exe ancestors, not just the shortest-walk one. The
+        // shortest is the terminal's ptyHost (no window); the renderer that
+        // owns the window is a further-up Code.exe. The PS helper picks the
+        // one that actually owns a top-level visible window.
+        const codePids = resolveCodeInstancePids(target.pids, snap);
+        if (codePids.length > 0) {
+          log.appendLine(`URI click: foregrounding Code.exe candidates [${codePids.join(',')}]`);
+          focusHwndByPidAsync(codePids);
+        } else {
+          log.appendLine('URI click: no Code.exe ancestor resolved from marker pids — taskbar will flash only');
+        }
+      }
+    } catch (e) {
+      log.appendLine(`URI click: foreground-steal failed — ${e.message}`);
+    }
+  }
+}
+
+// --- Windows foreground-lock opt-in (forceForeground) ---
+//
+// While HKCU ForegroundLockTimeout is non-zero, Windows blocks our
+// background banner-click handler from raising VS Code over other apps
+// (taskbar flash only). When the user opts into forceForeground we set it
+// to 0 (saving their original first) and restore on opt-out / uninstall.
+
+const FLT_ORIGINAL_KEY = 'cn.flt.original';
+const FLT_PROMPTED_KEY = 'cn.flt.prompted';
+
+function applyForceForeground(context, log) {
+  if (process.platform !== 'win32') return;
+  const enabled = vscode.workspace.getConfiguration('claudeNotifications')
+    .get('windows.forceForeground', false);
+  const current = winForegroundLock.getForegroundLockTimeout();
+  if (enabled) {
+    if (current === 0) return; // already 0
+    if (context.globalState.get(FLT_ORIGINAL_KEY) == null && current != null) {
+      context.globalState.update(FLT_ORIGINAL_KEY, current);
+    }
+    const r = winForegroundLock.setForegroundLockTimeout(0);
+    log.appendLine(`forceForeground: set ForegroundLockTimeout=0 (was ${current}) ok=${r.ok}${r.error ? ' err=' + r.error : ''}`);
+  } else {
+    const orig = context.globalState.get(FLT_ORIGINAL_KEY);
+    if (orig != null && current === 0) {
+      const r = winForegroundLock.setForegroundLockTimeout(orig);
+      log.appendLine(`forceForeground: restored ForegroundLockTimeout=${orig} ok=${r.ok}`);
+      context.globalState.update(FLT_ORIGINAL_KEY, undefined);
+    }
+  }
+}
+
+async function maybePromptForceForeground(context, log) {
+  if (process.platform !== 'win32') return;
+  if (context.globalState.get(FLT_PROMPTED_KEY)) return;
+  const cfg = vscode.workspace.getConfiguration('claudeNotifications');
+  if (cfg.get('windows.forceForeground', false)) return; // already on
+  const current = winForegroundLock.getForegroundLockTimeout();
+  if (current === 0) return; // nothing to gain — focus-steal already works
+  context.globalState.update(FLT_PROMPTED_KEY, true);
+  const choice = await vscode.window.showInformationMessage(
+    'Claude Notifications: want notification clicks to bring VS Code to the front automatically? ' +
+    'Right now Windows only flashes it in the taskbar. Enabling this flips one safe, instantly-reversible ' +
+    'Windows setting (ForegroundLockTimeout → 0) so VS Code can raise itself when you click a notification.',
+    'Enable instant focus', 'Keep taskbar flash'
+  );
+  if (choice === 'Enable instant focus') {
+    await cfg.update('windows.forceForeground', true, vscode.ConfigurationTarget.Global);
+    applyForceForeground(context, log); // config-change handler also fires; idempotent
+    vscode.window.showInformationMessage('Claude Notifications: instant focus enabled. Turn it off anytime in Settings — your previous Windows value is restored.');
   }
 }
 
@@ -636,18 +803,27 @@ async function cmdSetupHooks(context, log) {
 }
 
 async function cmdRemoveHooks(log) {
+  const profiles = discoverProfiles();
+  const profileCount = profiles.length;
+  const label = profileCount > 1
+    ? `all ${profileCount} Claude profiles`
+    : '~/.claude/settings.json';
   const choice = await vscode.window.showWarningMessage(
-    'Remove Claude Notifications hooks from ~/.claude/settings.json?',
+    `Remove Claude Notifications hooks from ${label}?`,
     'Remove', 'Cancel'
   );
   if (choice !== 'Remove') return;
 
-  const result = uninstallHooks();
-  if (result.success) {
-    log.appendLine(result.message);
-    vscode.window.showInformationMessage(result.message);
+  let anyFailed = false;
+  for (const profilePath of profiles) {
+    const result = uninstallHooks(profilePath);
+    log.appendLine(`${profilePath}: ${result.message}`);
+    if (!result.success) anyFailed = true;
+  }
+  if (anyFailed) {
+    vscode.window.showErrorMessage('Claude Notifications: some profiles could not be cleaned — see Output channel for details.');
   } else {
-    vscode.window.showErrorMessage(result.message);
+    vscode.window.showInformationMessage(`Claude Notifications hooks removed from ${profileCount} profile(s).`);
   }
 }
 
@@ -718,7 +894,7 @@ async function promptMacNotifierSetup(context, log) {
   }
 }
 
-async function cmdUninstall(log) {
+async function cmdUninstall(context, log) {
   const confirm = await vscode.window.showWarningMessage(
     'Uninstall Claude Notifications: remove Claude Code hooks, click-handler registry key (Windows), and per-workspace state directories?',
     { modal: true },
@@ -726,11 +902,14 @@ async function cmdUninstall(log) {
   );
   if (confirm !== 'Uninstall') return;
 
-  const { uninstallHooks } = require('./lib/hooks-installer');
-
   try {
-    uninstallHooks();
-    log.appendLine('Uninstall: hooks removed');
+    const profiles = discoverProfiles();
+    for (const profilePath of profiles) {
+      uninstallHooks(profilePath);
+      // Clean the backup file installHooks leaves next to each settings.json.
+      try { fs.rmSync(profilePath + '.backup', { force: true }); } catch (_) {}
+    }
+    log.appendLine(`Uninstall: hooks removed from ${profiles.length} profile(s)`);
   } catch (e) {
     log.appendLine(`Uninstall: hooks removal failed — ${e.message}`);
   }
@@ -765,6 +944,20 @@ async function cmdUninstall(log) {
     log.appendLine(`Uninstall: state dir removed (${stateDir})`);
   } catch (e) {
     log.appendLine(`Uninstall: state dir removal failed — ${e.message}`);
+  }
+
+  // Restore the user's original ForegroundLockTimeout if we changed it.
+  if (process.platform === 'win32') {
+    try {
+      const orig = context.globalState.get(FLT_ORIGINAL_KEY);
+      if (orig != null) {
+        winForegroundLock.setForegroundLockTimeout(orig);
+        context.globalState.update(FLT_ORIGINAL_KEY, undefined);
+        log.appendLine(`Uninstall: restored ForegroundLockTimeout=${orig}`);
+      }
+    } catch (e) {
+      log.appendLine(`Uninstall: FLT restore failed — ${e.message}`);
+    }
   }
 
   vscode.window.showInformationMessage(
