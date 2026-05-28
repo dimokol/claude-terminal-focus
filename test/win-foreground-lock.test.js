@@ -50,3 +50,32 @@ test('buildWriteCommand writes a REG_DWORD with /f', () => {
   const dIdx = cmd.args.indexOf('/d');
   assert.strictEqual(cmd.args[dIdx + 1], '0');
 });
+
+test('getForegroundLockTimeout returns parsed value via injected runner', () => {
+  const fakeRun = () => ({ status: 0, stdout: '    ForegroundLockTimeout    REG_DWORD    0x0\r\n', stderr: '' });
+  const { getForegroundLockTimeout } = require('../lib/win-foreground-lock');
+  assert.strictEqual(getForegroundLockTimeout({ runRegLike: fakeRun }), 0);
+});
+
+test('getForegroundLockTimeout returns null when reg fails', () => {
+  const fakeRun = () => ({ status: 1, stdout: '', stderr: 'ERROR' });
+  const { getForegroundLockTimeout } = require('../lib/win-foreground-lock');
+  assert.strictEqual(getForegroundLockTimeout({ runRegLike: fakeRun }), null);
+});
+
+test('setForegroundLockTimeout returns ok:true when reg add succeeds', () => {
+  const calls = [];
+  const fakeRun = (bin, args) => { calls.push(args); return { status: 0, stdout: '', stderr: '' }; };
+  const { setForegroundLockTimeout } = require('../lib/win-foreground-lock');
+  const r = setForegroundLockTimeout(0, { runRegLike: fakeRun });
+  assert.strictEqual(r.ok, true);
+  assert.ok(calls[0].includes('add'));
+  assert.strictEqual(calls[0][calls[0].indexOf('/d') + 1], '0');
+});
+
+test('setForegroundLockTimeout returns ok:false when reg add fails', () => {
+  const fakeRun = () => ({ status: 1, stdout: '', stderr: 'ACCESS DENIED' });
+  const { setForegroundLockTimeout } = require('../lib/win-foreground-lock');
+  const r = setForegroundLockTimeout(0, { runRegLike: fakeRun });
+  assert.strictEqual(r.ok, false);
+});
