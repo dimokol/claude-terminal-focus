@@ -75,15 +75,17 @@ This location is **outside** any workspace's `.vscode/` directory and therefore 
 ### Stage-ID state machine (`lib/stage-dedup.js`)
 
 ```
-shouldNotify(workspaceRoot, sessionId, currentEvent):
+shouldNotify(workspaceRoot, sessionId, currentEvent, currentHookEventName):
   - no sessionId                            → notify (can't dedup safely)
   - no entry for session                    → create stage 1, notify
   - lastEvent === null                      → set lastEvent=current, notify (post-prompt fresh stage)
-  - resolved === true                       → stageId++, lastEvent=current, resolved=false, notify
-  - unresolved, now - lastNotifiedAt > 3s   → stageId++, lastEvent=current, resolved=false, notify
-                                              (escape valve — see below)
-  - else (unresolved, fresh burst)          → update lastEvent=current, SUPPRESS
-                                              (collapses Claude's Stop→Notification pair into one alert)
+  - PR/PreToolUse→Notification within 30s   → SUPPRESS (trailing Notification of a request)
+  - resolved === true:
+       within burst window OR Notification  → SUPPRESS (trailer / re-fire after ack)
+       else (primary after window)          → stageId++, resolved=false, notify
+  - unresolved, >3s AND not a Notification  → stageId++, resolved=false, notify
+                                              (primary escape — new question/completion)
+  - else (within window, OR any Notification) → update lastEvent=current, SUPPRESS
 
 advanceOnPrompt(workspaceRoot, sessionId):  # called by hook-user-prompt.js
   stageId++, lastEvent=null, resolved=false
@@ -92,9 +94,11 @@ markResolved(workspaceRoot, sessionId):     # called by extension on EXPLICIT us
   resolved=true
 ```
 
-**Escape valve (`STAGE_ESCAPE_VALVE_MS = 3000`):** Claude Code's `AskUserQuestion` tool does NOT fire `PreToolUse`/`PostToolUse` hooks (upstream issue [anthropics/claude-code#15872](https://github.com/anthropics/claude-code/issues/15872)). That means there's no signal we can hook to advance the stage when a user answers a multi-choice question — so a follow-up `Notification` from the next `AskUserQuestion` (or any other delayed wait in the same stage) used to land in an unresolved stage and get silently swallowed. The escape valve fixes that by letting a same-stage event through if it arrives more than 3s after the last notification. The Stop/Notification platform-duplicate burst fires within ~100–200ms so it stays collapsed; real new waits always come after at least one tool call, which takes longer.
+**Primary vs trailer (the rule that guarantees exactly one notification per attention point).** Empirically (instrumented 2026-05-29), every attention point is announced by a PRIMARY event — `Stop` (completion) or `PermissionRequest`/`PreToolUse` (a new question / tool request; **every `AskUserQuestion` fires its own `PermissionRequest`**). A bare `Notification` is ALWAYS a trailer or a "still waiting" re-fire of the primary that already notified ("Claude is waiting for your input" / "Claude needs your permission"). So a `Notification` never escapes the burst window — it is always suppressed — while a primary arriving after the window is a genuinely new point and notifies. This guarantees **at least one** notification per question/completion and **at most one** (trailers and late re-fires collapse).
 
-**Revert path when #15872 ships:** drop `STAGE_ESCAPE_VALVE_MS` and the escape branch in `shouldNotify`; install a fifth hook entry for `PostToolUse` (matcher: `AskUserQuestion`) pointing at a new `dist/hook-tool-complete.js`; that hook reads `session_id` from stdin and calls `advanceOnPrompt`. The state machine then becomes purely event-driven again with no timing assumption.
+This also sidesteps the upstream `AskUserQuestion` limitation: Claude Code's `AskUserQuestion` does NOT fire `PreToolUse`/`PostToolUse` ([anthropics/claude-code#15872](https://github.com/anthropics/claude-code/issues/15872)), AND **answering a question does not emit `UserPromptSubmit`** (confirmed empirically), so there is no ack hook to advance the stage between back-to-back questions. We don't need one: each question's own `PermissionRequest` is the new-attention-point signal, so it notifies via the primary-escape branch. `STAGE_ESCAPE_VALVE_MS = 3000` is just the burst window (collapses the ~100ms–2s platform pair and the lock-ordering race); it no longer decides "new vs re-fire" by time.
+
+**If #15872 ships** (PostToolUse fires for AskUserQuestion): nothing is forced to change — the primary/trailer rule already works. Optionally, a `PostToolUse` hook calling `advanceOnPrompt` would let the burst window shrink, but it is no longer required.
 
 **Important — what counts as an "ack" for `markResolved`:** Focus-Terminal toast click,
 OS-banner click. The "Already on correct terminal" sound-only path **does not** call
