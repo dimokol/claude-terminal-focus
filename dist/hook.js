@@ -27,16 +27,29 @@ var require_signals = __commonJS({
       } catch (err) {
         if (err.code !== "EEXIST") return false;
       }
+      let stat;
       try {
-        const stat = fs2.statSync(handledPath);
-        if (Date.now() - stat.mtimeMs > staleMs) {
-          fs2.unlinkSync(handledPath);
+        stat = fs2.statSync(handledPath);
+      } catch (_) {
+        try {
           fs2.writeFileSync(handledPath, String(Date.now()), { flag: "wx" });
           return true;
+        } catch (_2) {
+          return false;
         }
-      } catch (_) {
       }
-      return false;
+      if (Date.now() - stat.mtimeMs <= staleMs) return false;
+      try {
+        fs2.unlinkSync(handledPath);
+      } catch (_) {
+        return false;
+      }
+      try {
+        fs2.writeFileSync(handledPath, String(Date.now()), { flag: "wx" });
+        return true;
+      } catch (_) {
+        return false;
+      }
     }
     function parseSignal(content) {
       const trimmed = content.trim();
@@ -56,8 +69,13 @@ var require_signals = __commonJS({
               sessionId: typeof data.sessionId === "string" ? data.sessionId : "",
               project: data.project || "Unknown",
               projectDir: data.projectDir || "",
+              workspaceRoot: typeof data.workspaceRoot === "string" ? data.workspaceRoot : "",
               pids: Array.isArray(data.pids) ? data.pids : [],
+              pidNames: data.pidNames && typeof data.pidNames === "object" ? data.pidNames : {},
+              shellPid: Number.isInteger(data.shellPid) && data.shellPid > 0 ? data.shellPid : 0,
+              pidChainSource: typeof data.pidChainSource === "string" ? data.pidChainSource : "",
               state: data.state === "fired" ? "fired" : "pending",
+              aiTitle: typeof data.aiTitle === "string" ? data.aiTitle : "",
               timestamp: data.timestamp || Date.now()
             };
           }
@@ -73,8 +91,13 @@ var require_signals = __commonJS({
         sessionId: "",
         project: "Claude Code",
         projectDir: "",
+        workspaceRoot: "",
         pids,
+        pidNames: {},
+        shellPid: 0,
+        pidChainSource: "",
         state: "pending",
+        aiTitle: "",
         timestamp: Date.now()
       };
     }
@@ -145,10 +168,60 @@ var require_stage_dedup = __commonJS({
     var path2 = require("path");
     var { getStateDir: getStateDir2, getSessionsPath } = require_state_paths();
     var SESSIONS_PRUNE_MS = 60 * 60 * 1e3;
+    var STAGE_ESCAPE_VALVE_MS = 3e3;
+    var PR_NOTIFICATION_BURST_MS = 3e4;
+    var LOCK_WAIT_MS = 1e3;
+    var LOCK_SLEEP_MS = 5;
+    var LOCK_STALE_MS = 2e3;
     function ensureDir(workspaceRoot) {
       const dir = getStateDir2(workspaceRoot);
       fs2.mkdirSync(dir, { recursive: true });
       return dir;
+    }
+    function sleepSync(ms) {
+      try {
+        const sab = new SharedArrayBuffer(4);
+        const view = new Int32Array(sab);
+        Atomics.wait(view, 0, 0, ms);
+      } catch (_) {
+        const until = Date.now() + ms;
+        while (Date.now() < until) {
+        }
+      }
+    }
+    function acquireLock(workspaceRoot) {
+      const dir = ensureDir(workspaceRoot);
+      const lockPath = path2.join(dir, "dedup.lock");
+      const deadline = Date.now() + LOCK_WAIT_MS;
+      while (Date.now() < deadline) {
+        try {
+          fs2.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+          return lockPath;
+        } catch (err) {
+          if (err.code !== "EEXIST") return null;
+        }
+        try {
+          const stat = fs2.statSync(lockPath);
+          if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+            try {
+              fs2.unlinkSync(lockPath);
+            } catch (_) {
+            }
+            continue;
+          }
+        } catch (_) {
+          continue;
+        }
+        sleepSync(LOCK_SLEEP_MS);
+      }
+      return null;
+    }
+    function releaseLock(lockPath) {
+      if (!lockPath) return;
+      try {
+        fs2.unlinkSync(lockPath);
+      } catch (_) {
+      }
     }
     function readSessions(workspaceRoot) {
       const p = getSessionsPath(workspaceRoot);
@@ -166,71 +239,138 @@ var require_stage_dedup = __commonJS({
         const u = map[key] && map[key].updatedAt;
         if (typeof u === "number" && now - u > SESSIONS_PRUNE_MS) delete map[key];
       }
+      const finalPath = getSessionsPath(workspaceRoot);
+      const tmpPath = finalPath + ".tmp." + process.pid + "." + now;
       try {
-        fs2.writeFileSync(getSessionsPath(workspaceRoot), JSON.stringify(map));
+        fs2.writeFileSync(tmpPath, JSON.stringify(map));
+        fs2.renameSync(tmpPath, finalPath);
       } catch (_) {
+        try {
+          fs2.unlinkSync(tmpPath);
+        } catch (_2) {
+        }
       }
     }
-    function shouldNotify(workspaceRoot, sessionId, currentEvent) {
+    function shouldNotify(workspaceRoot, sessionId, currentEvent, currentHookEventName) {
       if (!sessionId) return { notify: true, stageId: null };
-      const map = readSessions(workspaceRoot);
-      const now = Date.now();
-      let entry = map[sessionId];
-      if (!entry) {
-        entry = { stageId: 1, lastEvent: currentEvent, resolved: false, lastNotifiedAt: now, updatedAt: now };
-        map[sessionId] = entry;
-        writeSessions(workspaceRoot, map);
-        return { notify: true, stageId: 1 };
-      }
-      if (entry.lastEvent === null) {
+      const lock = acquireLock(workspaceRoot);
+      try {
+        const map = readSessions(workspaceRoot);
+        const now = Date.now();
+        let entry = map[sessionId];
+        if (!entry) {
+          entry = {
+            stageId: 1,
+            lastEvent: currentEvent,
+            lastHookEventName: currentHookEventName || null,
+            resolved: false,
+            lastNotifiedAt: now,
+            updatedAt: now
+          };
+          map[sessionId] = entry;
+          writeSessions(workspaceRoot, map);
+          return { notify: true, stageId: 1 };
+        }
+        const lastHook = entry.lastHookEventName;
+        if ((lastHook === "PermissionRequest" || lastHook === "PreToolUse") && currentHookEventName === "Notification" && now - (entry.lastNotifiedAt || 0) < PR_NOTIFICATION_BURST_MS) {
+          entry.lastEvent = currentEvent;
+          entry.lastHookEventName = currentHookEventName;
+          entry.updatedAt = now;
+          writeSessions(workspaceRoot, map);
+          return { notify: false, stageId: entry.stageId };
+        }
+        if (entry.lastEvent === null) {
+          entry.lastEvent = currentEvent;
+          entry.lastHookEventName = currentHookEventName || null;
+          entry.resolved = false;
+          entry.lastNotifiedAt = now;
+          entry.updatedAt = now;
+          writeSessions(workspaceRoot, map);
+          return { notify: true, stageId: entry.stageId };
+        }
+        if (entry.resolved === true) {
+          const lastAt2 = entry.lastNotifiedAt || 0;
+          if (now - lastAt2 < STAGE_ESCAPE_VALVE_MS || currentHookEventName === "Notification") {
+            entry.lastEvent = currentEvent;
+            entry.lastHookEventName = currentHookEventName || entry.lastHookEventName || null;
+            entry.updatedAt = now;
+            writeSessions(workspaceRoot, map);
+            return { notify: false, stageId: entry.stageId };
+          }
+          entry.stageId = (entry.stageId || 0) + 1;
+          entry.lastEvent = currentEvent;
+          entry.lastHookEventName = currentHookEventName || null;
+          entry.resolved = false;
+          entry.lastNotifiedAt = now;
+          entry.updatedAt = now;
+          writeSessions(workspaceRoot, map);
+          return { notify: true, stageId: entry.stageId };
+        }
+        const lastAt = entry.lastNotifiedAt || 0;
+        if (now - lastAt > STAGE_ESCAPE_VALVE_MS && currentHookEventName !== "Notification") {
+          entry.stageId = (entry.stageId || 0) + 1;
+          entry.lastEvent = currentEvent;
+          entry.lastHookEventName = currentHookEventName || null;
+          entry.resolved = false;
+          entry.lastNotifiedAt = now;
+          entry.updatedAt = now;
+          writeSessions(workspaceRoot, map);
+          return { notify: true, stageId: entry.stageId };
+        }
         entry.lastEvent = currentEvent;
-        entry.resolved = false;
-        entry.lastNotifiedAt = now;
+        entry.lastHookEventName = currentHookEventName || entry.lastHookEventName || null;
         entry.updatedAt = now;
         writeSessions(workspaceRoot, map);
-        return { notify: true, stageId: entry.stageId };
+        return { notify: false, stageId: entry.stageId };
+      } finally {
+        releaseLock(lock);
       }
-      if (entry.resolved === true) {
-        entry.stageId = (entry.stageId || 0) + 1;
-        entry.lastEvent = currentEvent;
-        entry.resolved = false;
-        entry.lastNotifiedAt = now;
-        entry.updatedAt = now;
-        writeSessions(workspaceRoot, map);
-        return { notify: true, stageId: entry.stageId };
-      }
-      entry.lastEvent = currentEvent;
-      entry.updatedAt = now;
-      writeSessions(workspaceRoot, map);
-      return { notify: false, stageId: entry.stageId };
     }
     function advanceOnPrompt(workspaceRoot, sessionId) {
       if (!sessionId) return;
-      const map = readSessions(workspaceRoot);
-      const now = Date.now();
-      const entry = map[sessionId] || { stageId: 0, lastEvent: null, resolved: false, lastNotifiedAt: 0, updatedAt: now };
-      entry.stageId = (entry.stageId || 0) + 1;
-      entry.lastEvent = null;
-      entry.resolved = false;
-      entry.updatedAt = now;
-      map[sessionId] = entry;
-      writeSessions(workspaceRoot, map);
+      const lock = acquireLock(workspaceRoot);
+      try {
+        const map = readSessions(workspaceRoot);
+        const now = Date.now();
+        const entry = map[sessionId] || { stageId: 0, lastEvent: null, lastHookEventName: null, resolved: false, lastNotifiedAt: 0, updatedAt: now };
+        entry.stageId = (entry.stageId || 0) + 1;
+        entry.lastEvent = null;
+        entry.lastHookEventName = null;
+        entry.resolved = false;
+        entry.updatedAt = now;
+        map[sessionId] = entry;
+        writeSessions(workspaceRoot, map);
+      } finally {
+        releaseLock(lock);
+      }
     }
     function markResolved(workspaceRoot, sessionId) {
       if (!sessionId) return;
-      const map = readSessions(workspaceRoot);
-      const entry = map[sessionId];
-      if (!entry) return;
-      entry.resolved = true;
-      entry.updatedAt = Date.now();
-      writeSessions(workspaceRoot, map);
+      const lock = acquireLock(workspaceRoot);
+      try {
+        const map = readSessions(workspaceRoot);
+        const entry = map[sessionId];
+        if (!entry) return;
+        entry.resolved = true;
+        entry.updatedAt = Date.now();
+        writeSessions(workspaceRoot, map);
+      } finally {
+        releaseLock(lock);
+      }
     }
     module2.exports = {
       SESSIONS_PRUNE_MS,
+      STAGE_ESCAPE_VALVE_MS,
+      PR_NOTIFICATION_BURST_MS,
+      LOCK_WAIT_MS,
+      LOCK_STALE_MS,
       shouldNotify,
       advanceOnPrompt,
       markResolved,
-      _readSessions: readSessions
+      _readSessions: readSessions,
+      // Exposed for tests:
+      acquireLock,
+      releaseLock
     };
   }
 });
@@ -258,19 +398,263 @@ var require_click_marker = __commonJS({
         event: data.event === "completed" ? "completed" : "waiting",
         project: typeof data.project === "string" ? data.project : "Unknown",
         pids: Array.isArray(data.pids) ? data.pids.filter((p) => Number.isInteger(p) && p > 0) : [],
+        shellPid: Number.isInteger(data.shellPid) && data.shellPid > 0 ? data.shellPid : 0,
+        workspaceRoot: typeof data.workspaceRoot === "string" ? data.workspaceRoot : "",
+        projectDir: typeof data.projectDir === "string" ? data.projectDir : "",
+        aiTitle: typeof data.aiTitle === "string" ? data.aiTitle : "",
         timestamp: typeof data.timestamp === "number" ? data.timestamp : Date.now()
       };
     }
-    function buildClickMarkerPayload2({ sessionId, pids, event, project }) {
+    function buildClickMarkerPayload2({ sessionId, pids, shellPid, workspaceRoot, projectDir, event, project, aiTitle }) {
       return JSON.stringify({
         sessionId: sessionId || "",
         event: event === "completed" ? "completed" : "waiting",
         project: project || "Unknown",
         pids: Array.isArray(pids) ? pids : [],
+        shellPid: Number.isInteger(shellPid) && shellPid > 0 ? shellPid : 0,
+        workspaceRoot: workspaceRoot || "",
+        projectDir: projectDir || "",
+        aiTitle: typeof aiTitle === "string" ? aiTitle : "",
         timestamp: Date.now()
       });
     }
     module2.exports = { parseClickMarker, buildClickMarkerPayload: buildClickMarkerPayload2, CLICK_MARKER_STALE_MS };
+  }
+});
+
+// lib/transcript-title.js
+var require_transcript_title = __commonJS({
+  "lib/transcript-title.js"(exports2, module2) {
+    var fs2 = require("fs");
+    function readAiTitle2(transcriptPath) {
+      if (typeof transcriptPath !== "string" || transcriptPath === "") return null;
+      let content;
+      try {
+        content = fs2.readFileSync(transcriptPath, "utf8");
+      } catch (_) {
+        return null;
+      }
+      if (!content) return null;
+      const lines = content.split("\n");
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        if (line.indexOf('"ai-title"') === -1) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (obj && obj.type === "ai-title" && typeof obj.aiTitle === "string" && obj.aiTitle.trim() !== "") {
+            return obj.aiTitle.trim();
+          }
+        } catch (_) {
+        }
+      }
+      return null;
+    }
+    module2.exports = { readAiTitle: readAiTitle2 };
+  }
+});
+
+// lib/process-tree.js
+var require_process_tree = __commonJS({
+  "lib/process-tree.js"(exports2, module2) {
+    var { execSync: execSync2 } = require("child_process");
+    var WALK_UP_LIMIT = 30;
+    function snapshot() {
+      if (process.platform === "win32") {
+        return snapshotWindows();
+      }
+      return snapshotPosix();
+    }
+    function snapshotWindows() {
+      try {
+        const ps = `Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Json -Compress`;
+        const out = execSync2(`powershell -NoProfile -NonInteractive -Command "${ps}"`, {
+          encoding: "utf8",
+          timeout: 5e3,
+          maxBuffer: 16 * 1024 * 1024,
+          stdio: ["pipe", "pipe", "pipe"]
+        });
+        const procs = parsePowerShellJson(out);
+        if (procs.size > 0) return { procs, source: "powershell" };
+      } catch (_) {
+      }
+      try {
+        const out = execSync2(
+          `wmic process get ProcessId,ParentProcessId,Name /format:csv`,
+          { encoding: "utf8", timeout: 5e3, maxBuffer: 16 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] }
+        );
+        const procs = parseWmicCsv(out);
+        if (procs.size > 0) return { procs, source: "wmic" };
+      } catch (_) {
+      }
+      return { procs: /* @__PURE__ */ new Map(), source: "failed" };
+    }
+    function snapshotPosix() {
+      try {
+        const out = execSync2("ps -A -o pid=,ppid=,comm=", {
+          encoding: "utf8",
+          timeout: 3e3,
+          maxBuffer: 8 * 1024 * 1024,
+          stdio: ["pipe", "pipe", "pipe"]
+        });
+        const procs = parsePsOutput(out);
+        if (procs.size > 0) return { procs, source: "ps" };
+      } catch (_) {
+      }
+      return { procs: /* @__PURE__ */ new Map(), source: "failed" };
+    }
+    function parsePowerShellJson(text) {
+      const procs = /* @__PURE__ */ new Map();
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch (_) {
+        return procs;
+      }
+      const list = Array.isArray(parsed) ? parsed : [parsed];
+      for (const row of list) {
+        if (!row || typeof row !== "object") continue;
+        const pid = toInt(row.ProcessId);
+        const ppid = toInt(row.ParentProcessId);
+        const name = typeof row.Name === "string" ? row.Name : "";
+        if (pid > 0) procs.set(pid, { pid, ppid, name });
+      }
+      return procs;
+    }
+    function parseWmicCsv(text) {
+      const procs = /* @__PURE__ */ new Map();
+      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      if (lines.length < 2) return procs;
+      const header = lines[0].split(",").map((s) => s.trim().toLowerCase());
+      const nameIdx = header.indexOf("name");
+      const pidIdx = header.indexOf("processid");
+      const ppidIdx = header.indexOf("parentprocessid");
+      if (pidIdx < 0 || ppidIdx < 0) return procs;
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(",");
+        const pid = toInt(cols[pidIdx]);
+        const ppid = toInt(cols[ppidIdx]);
+        const name = nameIdx >= 0 ? (cols[nameIdx] || "").trim() : "";
+        if (pid > 0) procs.set(pid, { pid, ppid, name });
+      }
+      return procs;
+    }
+    function parsePsOutput(text) {
+      const procs = /* @__PURE__ */ new Map();
+      for (const line of text.split("\n")) {
+        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+        if (!m) continue;
+        const pid = toInt(m[1]);
+        const ppid = toInt(m[2]);
+        const name = m[3].trim();
+        if (pid > 0) procs.set(pid, { pid, ppid, name });
+      }
+      return procs;
+    }
+    function toInt(value) {
+      const n = parseInt(value, 10);
+      return Number.isFinite(n) ? n : 0;
+    }
+    function walkUp2(snapshotResult, pid, limit = WALK_UP_LIMIT) {
+      const { procs } = snapshotResult;
+      const chain = [];
+      const seen = /* @__PURE__ */ new Set();
+      let current = pid;
+      while (current && current > 0 && chain.length < limit) {
+        if (seen.has(current)) break;
+        seen.add(current);
+        const node = procs.get(current);
+        if (!node) {
+          chain.push({ pid: current, ppid: 0, name: "" });
+          break;
+        }
+        chain.push(node);
+        if (!node.ppid || node.ppid === current) break;
+        current = node.ppid;
+      }
+      return chain;
+    }
+    function walkDown(snapshotResult, rootPid) {
+      const { procs } = snapshotResult;
+      const childIndex = /* @__PURE__ */ new Map();
+      for (const node of procs.values()) {
+        if (!node.ppid) continue;
+        if (!childIndex.has(node.ppid)) childIndex.set(node.ppid, []);
+        childIndex.get(node.ppid).push(node.pid);
+      }
+      const result = /* @__PURE__ */ new Set();
+      const stack = [rootPid];
+      while (stack.length) {
+        const pid = stack.pop();
+        if (result.has(pid)) continue;
+        result.add(pid);
+        const children = childIndex.get(pid);
+        if (children) stack.push(...children);
+      }
+      return result;
+    }
+    module2.exports = {
+      snapshot,
+      walkUp: walkUp2,
+      walkDown,
+      // Exposed for tests:
+      parsePowerShellJson,
+      parseWmicCsv,
+      parsePsOutput,
+      WALK_UP_LIMIT
+    };
+  }
+});
+
+// lib/code-build.js
+var require_code_build = __commonJS({
+  "lib/code-build.js"(exports2, module2) {
+    "use strict";
+    var BUILDS = [
+      { id: "insiders", re: /^Code - Insiders\.exe$/i, scheme: "vscode-insiders", cli: "code-insiders" },
+      { id: "stable", re: /^Code\.exe$/i, scheme: "vscode", cli: "code" },
+      { id: "vscodium", re: /^(VSCodium|Codium)\.exe$/i, scheme: "vscodium", cli: "codium" },
+      { id: "cursor", re: /^Cursor\.exe$/i, scheme: "cursor", cli: "cursor" },
+      { id: "windsurf", re: /^Windsurf\.exe$/i, scheme: "windsurf", cli: "windsurf" }
+    ];
+    var CLI_PREFERENCE = ["code", "code-insiders", "codium", "cursor", "windsurf"];
+    function buildFor(name) {
+      if (typeof name !== "string" || name === "") return null;
+      const base = name.replace(/^.*[/\\]/, "");
+      return BUILDS.find((b) => b.re.test(base)) || null;
+    }
+    function classifyBuild2(name) {
+      const b = buildFor(name);
+      return b ? b.id : null;
+    }
+    function schemeForBinaryName2(binaryName, fallback = "vscode") {
+      const b = buildFor(binaryName);
+      return b ? b.scheme : fallback;
+    }
+    function cliForBinaryName(binaryName) {
+      const b = buildFor(binaryName);
+      return b ? b.cli : null;
+    }
+    function resolveCodeCli({ binaryName, probe, fallback = "code" } = {}) {
+      const mapped = cliForBinaryName(binaryName);
+      if (mapped) {
+        if (typeof probe !== "function" || probe(mapped)) return mapped;
+      }
+      if (typeof probe === "function") {
+        for (const cli of CLI_PREFERENCE) {
+          if (probe(cli)) return cli;
+        }
+      }
+      return fallback;
+    }
+    module2.exports = {
+      BUILDS,
+      CLI_PREFERENCE,
+      classifyBuild: classifyBuild2,
+      schemeForBinaryName: schemeForBinaryName2,
+      cliForBinaryName,
+      resolveCodeCli
+    };
   }
 });
 
@@ -280,6 +664,7 @@ var path = require("path");
 var { execSync, execFile, spawn } = require("child_process");
 var os = require("os");
 var { setTimeout: sleep } = require("node:timers/promises");
+var { pathToFileURL } = require("node:url");
 var { claimHandled, eventPriority } = require_signals();
 var {
   getStateDir,
@@ -289,10 +674,63 @@ var {
 } = require_state_paths();
 var { shouldNotify: checkShouldNotify } = require_stage_dedup();
 var { buildClickMarkerPayload } = require_click_marker();
+var { readAiTitle } = require_transcript_title();
+var { snapshot: processSnapshot, walkUp } = require_process_tree();
+var { schemeForBinaryName, classifyBuild } = require_code_build();
+var SHELL_PROCESS_NAMES = /* @__PURE__ */ new Set([
+  "bash.exe",
+  "sh.exe",
+  "zsh.exe",
+  "pwsh.exe",
+  "powershell.exe",
+  "cmd.exe",
+  "fish.exe",
+  "wsl.exe",
+  // POSIX (no .exe), as reported by `ps -o comm=`. Includes the
+  // login-shell '-' prefix variants.
+  "bash",
+  "-bash",
+  "sh",
+  "-sh",
+  "zsh",
+  "-zsh",
+  "pwsh",
+  "powershell",
+  "fish",
+  "-fish"
+]);
 var CONFIG_FILE = "claude-notifications-config.json";
 var DEFAULT_HANDSHAKE_MS = 1200;
 function shEsc(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+function buildHiddenPsArgv(tmpScript) {
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  const hideVbsPath = path.join(localAppData, "claude-notifications", "hide.vbs");
+  const psTail = [
+    "powershell.exe",
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    tmpScript
+  ];
+  let useVbs = false;
+  try {
+    useVbs = fs.existsSync(hideVbsPath);
+  } catch (_) {
+    useVbs = false;
+  }
+  if (useVbs) {
+    return ["/c", "start", '""', "/B", "wscript.exe", hideVbsPath, ...psTail];
+  }
+  return ["/c", "start", '""', "/B", ...psTail];
+}
+function xmlEsc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 (async () => {
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -301,16 +739,26 @@ function shEsc(s) {
   let hookEventName = "";
   let hookMessage = "";
   let sessionId = "";
+  let transcriptPath = "";
   try {
     const stdinData = fs.readFileSync(0, "utf8");
     const input = JSON.parse(stdinData);
     hookEventName = input.hook_event_name || "";
     hookMessage = typeof input.message === "string" ? input.message : "";
     sessionId = input.session_id || "";
+    transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
     const eventName = hookEventName.toLowerCase();
     if (eventName === "stop") hookEvent = "completed";
     else hookEvent = "waiting";
   } catch (_) {
+  }
+  const MAX_TITLE_LEN = 60;
+  let aiTitle = "";
+  if (transcriptPath) {
+    const raw = readAiTitle(transcriptPath);
+    if (raw) {
+      aiTitle = raw.length > MAX_TITLE_LEN ? raw.slice(0, MAX_TITLE_LEN - 1) + "\u2026" : raw;
+    }
   }
   const configPath = path.join(os.homedir(), ".claude", CONFIG_FILE);
   let config = { muted: false, soundEnabled: true, volume: 0.5 };
@@ -340,50 +788,35 @@ function shEsc(s) {
   const signalPath = getSignalPath(workspaceRoot);
   const claimPath = getClaimedPath(workspaceRoot);
   const clickedPath = getClickedPath(workspaceRoot);
-  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent);
+  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent, hookEventName);
   if (!dedup.notify) {
     process.exit(0);
   }
-  function getPidChain() {
-    const pids2 = [];
-    let currentPid = process.pid;
-    if (process.platform === "win32") {
-      while (currentPid && currentPid > 0) {
-        pids2.push(currentPid);
-        try {
-          const output = execSync(
-            `wmic process where ProcessId=${currentPid} get ParentProcessId /value`,
-            { encoding: "utf8", timeout: 2e3, stdio: ["pipe", "pipe", "pipe"] }
-          );
-          const match = output.match(/ParentProcessId=(\d+)/);
-          if (!match) break;
-          const parentPid = parseInt(match[1], 10);
-          if (parentPid === currentPid || parentPid === 0) break;
-          currentPid = parentPid;
-        } catch (_) {
-          break;
-        }
-      }
-    } else {
-      while (currentPid && currentPid > 1) {
-        pids2.push(currentPid);
-        try {
-          const output = execSync(`ps -o ppid= -p ${currentPid}`, {
-            encoding: "utf8",
-            timeout: 2e3,
-            stdio: ["pipe", "pipe", "pipe"]
-          });
-          const parentPid = parseInt(output.trim(), 10);
-          if (isNaN(parentPid) || parentPid <= 0 || parentPid === currentPid) break;
-          currentPid = parentPid;
-        } catch (_) {
-          break;
-        }
-      }
-    }
-    return pids2;
+  const snap = processSnapshot();
+  const chain = walkUp(snap, process.pid);
+  const pids = chain.map((n) => n.pid);
+  const pidNames = {};
+  for (const node of chain) {
+    if (node.name) pidNames[String(node.pid)] = node.name;
   }
-  const pids = getPidChain();
+  let shellPid = 0;
+  for (const node of chain) {
+    if (!node.name) continue;
+    const base = node.name.toLowerCase().replace(/^.*[/\\]/, "").replace(/^-/, "");
+    if (SHELL_PROCESS_NAMES.has(base)) {
+      shellPid = node.pid;
+      break;
+    }
+  }
+  try {
+    const tip = chain.length > 0 ? chain[chain.length - 1] : null;
+    const tipDesc = tip ? `pid=${tip.pid} name=${tip.name || "?"}` : "empty-chain";
+    process.stderr.write(
+      `claude-notifications: chain depth=${chain.length} source=${snap.source} shellPid=${shellPid || "none"} tip=${tipDesc}
+`
+    );
+  } catch (_) {
+  }
   let shouldWriteSignal = true;
   try {
     const existing = JSON.parse(fs.readFileSync(signalPath, "utf8"));
@@ -403,7 +836,11 @@ function shEsc(s) {
       projectDir,
       workspaceRoot,
       pids,
+      pidNames,
+      shellPid: shellPid || void 0,
+      pidChainSource: snap.source,
       state: "pending",
+      aiTitle,
       timestamp: Date.now()
     };
     fs.writeFileSync(signalPath, JSON.stringify(signalPayload, null, 2));
@@ -446,33 +883,50 @@ function shEsc(s) {
       try {
         if (process.platform === "darwin") {
           const vol = (volume / 100).toFixed(3);
-          execFile("afplay", ["-v", vol, fileToPlay], () => {
+          const child = spawn("afplay", ["-v", vol, fileToPlay], {
+            detached: true,
+            stdio: "ignore"
           });
+          child.unref();
         } else if (process.platform === "win32") {
-          const esc = fileToPlay.replace(/'/g, "''");
+          const fileUri = pathToFileURL(fileToPlay);
           const vol = (volume / 100).toFixed(3);
           const psCmd = `
             try {
               Add-Type -AssemblyName PresentationCore -ErrorAction Stop
               $p = New-Object System.Windows.Media.MediaPlayer
-              $p.Open([System.Uri]::new('${esc}', [System.UriKind]::Absolute))
+              $p.Open([System.Uri]'${fileUri}')
               $p.Volume = ${vol}
-              while (-not $p.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 20 }
-              $ms = [int]$p.NaturalDuration.TimeSpan.TotalMilliseconds + 150
+              $deadline = (Get-Date).AddSeconds(3)
+              while (-not $p.NaturalDuration.HasTimeSpan -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 20
+              }
+              if ($p.NaturalDuration.HasTimeSpan) {
+                $ms = [int]$p.NaturalDuration.TimeSpan.TotalMilliseconds + 150
+              } else { $ms = 1500 }
               $p.Play()
               Start-Sleep -Milliseconds $ms
               $p.Close()
             } catch {
-              (New-Object System.Media.SoundPlayer '${esc}').PlaySync()
+              try { (New-Object System.Media.SoundPlayer '${fileToPlay.replace(/'/g, "''")}').PlaySync() } catch {}
             }`.trim();
-          execFile("powershell", ["-NoProfile", "-Command", psCmd], () => {
+          const tmpSoundScript = path.join(os.tmpdir(), `claude-sound-${Date.now()}-${process.pid}.ps1`);
+          const soundCleanup = `
+try {} finally { Remove-Item -LiteralPath '${tmpSoundScript.replace(/'/g, "''")}' -Force -ErrorAction SilentlyContinue }`;
+          fs.writeFileSync(tmpSoundScript, "\uFEFF" + psCmd + soundCleanup, "utf8");
+          const child = spawn("cmd.exe", buildHiddenPsArgv(tmpSoundScript), {
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true
           });
+          child.unref();
         } else {
           const paVol = String(Math.round(volume / 100 * 65536));
-          execFile("paplay", ["--volume", paVol, fileToPlay], (err) => {
-            if (err) execFile("aplay", [fileToPlay], () => {
-            });
+          const child = spawn("sh", ["-c", `paplay --volume=${paVol} '${fileToPlay.replace(/'/g, "'\\''")}' || aplay '${fileToPlay.replace(/'/g, "'\\''")}'`], {
+            detached: true,
+            stdio: "ignore"
           });
+          child.unref();
         }
       } catch (_) {
       }
@@ -497,11 +951,15 @@ function shEsc(s) {
       const clickPayload = buildClickMarkerPayload({
         sessionId,
         pids,
+        shellPid,
+        workspaceRoot,
+        projectDir,
         event: hookEvent,
-        project: projectName
+        project: projectName,
+        aiTitle
       });
       const executeCmd = `/usr/bin/printf '%s' ${shEsc(clickPayload)} > ${shEsc(clickedPath)} && ${shEsc(codeCli)} ${shEsc(workspaceRoot)}`;
-      const child = spawn("terminal-notifier", [
+      const notifierArgs = [
         "-title",
         eventInfo.title,
         "-message",
@@ -510,11 +968,16 @@ function shEsc(s) {
         executeCmd,
         "-group",
         `claude-${projectName}`
-      ], { detached: true, stdio: "ignore" });
+      ];
+      if (aiTitle) {
+        notifierArgs.splice(2, 0, "-subtitle", aiTitle);
+      }
+      const child = spawn("terminal-notifier", notifierArgs, { detached: true, stdio: "ignore" });
       child.unref();
     } catch (_) {
       try {
-        execSync(`osascript -e 'display notification "${eventInfo.message}" with title "${eventInfo.title}"'`, {
+        const osaTitle = aiTitle ? `${eventInfo.title} \u2014 ${aiTitle.replace(/"/g, '\\"')}` : eventInfo.title;
+        execSync(`osascript -e 'display notification "${eventInfo.message}" with title "${osaTitle}"'`, {
           timeout: 3e3,
           stdio: "ignore"
         });
@@ -522,17 +985,36 @@ function shEsc(s) {
       }
     }
   } else if (process.platform === "win32") {
-    const vscodePath = workspaceRoot.replace(/\\/g, "/");
-    const vscodeUri = `vscode://file/${vscodePath}`;
     const tmpScript = path.join(os.tmpdir(), `claude-notif-${Date.now()}-${process.pid}.ps1`);
+    const titleLine = aiTitle ? `    <text>${xmlEsc(aiTitle)}</text>` : "";
+    const clickMarkerJson = buildClickMarkerPayload({
+      sessionId,
+      pids,
+      shellPid,
+      workspaceRoot,
+      projectDir,
+      event: hookEvent,
+      project: projectName,
+      aiTitle
+    });
+    const clickMarkerB64 = Buffer.from(clickMarkerJson, "utf8").toString("base64");
+    let launchScheme = "vscode";
+    for (const node of chain) {
+      if (node && node.name && classifyBuild(node.name)) {
+        launchScheme = schemeForBinaryName(node.name);
+        break;
+      }
+    }
+    const toastLaunchUri = `${launchScheme}://dimokol.claude-notifications/click?marker=${encodeURIComponent(clickMarkerB64)}`;
     const psScriptBody = `
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
 $template = @"
-<toast activationType="protocol" launch="${vscodeUri}" duration="long">
+<toast activationType="protocol" launch="${xmlEsc(toastLaunchUri)}" duration="long">
   <visual><binding template="ToastGeneric">
-    <text>${eventInfo.title}</text>
-    <text>${eventInfo.message}</text>
+    <text>${xmlEsc(eventInfo.title)}</text>
+${titleLine}
+    <text>${xmlEsc(eventInfo.message)}</text>
   </binding></visual>
   <audio src="ms-winsoundevent:Notification.Default" silent="true" />
 </toast>
@@ -548,21 +1030,8 @@ try {
 }
 `;
     try {
-      fs.writeFileSync(tmpScript, psScriptBody, "utf8");
-      const child = spawn("cmd.exe", [
-        "/c",
-        "start",
-        '""',
-        "/B",
-        "powershell.exe",
-        "-NoProfile",
-        "-WindowStyle",
-        "Hidden",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        tmpScript
-      ], {
+      fs.writeFileSync(tmpScript, "\uFEFF" + psScriptBody, "utf8");
+      const child = spawn("cmd.exe", buildHiddenPsArgv(tmpScript), {
         detached: true,
         stdio: "ignore",
         windowsHide: true
@@ -586,4 +1055,5 @@ try {
     } catch (_) {
     }
   }
+  process.exit(0);
 })();

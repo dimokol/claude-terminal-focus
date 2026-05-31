@@ -2,7 +2,7 @@
 
 > Project: **Claude Notifications** — VS Code extension (publisher `dimokol`, id `dimokol.claude-notifications`).
 > Repo name on disk: `claude-terminal-focus` (legacy directory name; do not rename, the publisher id is what users see).
-> Current version: **3.3.1**.
+> Current version: **3.5.0**.
 > User: solo maintainer, dev machine is macOS, target users are Claude Code users on macOS / Windows / Linux.
 
 This file is the entry point for any Claude / AI coding agent working in this repo. Read it before touching code or doing release work.
@@ -36,8 +36,16 @@ repo root
 │   ├── state-paths.js        # ~/.claude/focus-state/<sha1(workspace).slice(0,12)>/ path derivation.
 │   ├── stage-dedup.js        # Stage-ID state machine (shouldNotify, advanceOnPrompt, markResolved).
 │   ├── click-marker.js       # Parse/build the JSON payload terminal-notifier writes on click.
-│   ├── hooks-installer.js    # Read/write ~/.claude/settings.json hook entries.
+│   ├── process-tree.js       # Cross-platform process snapshot + walkUp/walkDown. Replaces per-PID wmic/ps.
+│   ├── terminal-match.js     # Tiered terminal-matching (PID → cwd → Claude markers → non-default-name).
+│   ├── hooks-installer.js    # Read/write ~/.claude/settings.json hook entries. As of 3.5.0 entries point at the wrapper (see bin/hook-wrapper.cjs), not at the extension's dist/.
+│   ├── hook-runtime.js       # installHookRuntime / uninstallHookRuntime — manages the stable-location wrapper dir at ~/.claude/claude-notifications/.
+│   ├── win-protocol.js       # claude-notif:// URI scheme + HKCU registry CRUD (Windows-only side effects; pure helpers tested on macOS).
 │   └── sounds.js             # Cross-platform sound playback.
+│
+├── bin/
+│   ├── hook-wrapper.cjs      # Stable-location wrapper invoked by Claude Code's hook subsystem. Detects extension-uninstalled and self-destructs. Bundled to dist/.
+│   └── win-click-handler.js  # Launcher invoked by Windows shell when the user clicks the OS toast. Bundled to dist/.
 │
 ├── test/                     # node:test unit tests for state-paths and stage-dedup. Run with `npm test`.
 ├── docs/
@@ -67,13 +75,17 @@ This location is **outside** any workspace's `.vscode/` directory and therefore 
 ### Stage-ID state machine (`lib/stage-dedup.js`)
 
 ```
-shouldNotify(workspaceRoot, sessionId, currentEvent):
-  - no sessionId            → notify (can't dedup safely)
-  - no entry for session    → create stage 1, notify
-  - lastEvent === null      → set lastEvent=current, notify (post-prompt fresh stage)
-  - resolved === true       → stageId++, lastEvent=current, resolved=false, notify
-  - else (unresolved stage) → update lastEvent=current, SUPPRESS
-                              (collapses Claude's Stop→Notification pair into one alert)
+shouldNotify(workspaceRoot, sessionId, currentEvent, currentHookEventName):
+  - no sessionId                            → notify (can't dedup safely)
+  - no entry for session                    → create stage 1, notify
+  - lastEvent === null                      → set lastEvent=current, notify (post-prompt fresh stage)
+  - PR/PreToolUse→Notification within 30s   → SUPPRESS (trailing Notification of a request)
+  - resolved === true:
+       within burst window OR Notification  → SUPPRESS (trailer / re-fire after ack)
+       else (primary after window)          → stageId++, resolved=false, notify
+  - unresolved, >3s AND not a Notification  → stageId++, resolved=false, notify
+                                              (primary escape — new question/completion)
+  - else (within window, OR any Notification) → update lastEvent=current, SUPPRESS
 
 advanceOnPrompt(workspaceRoot, sessionId):  # called by hook-user-prompt.js
   stageId++, lastEvent=null, resolved=false
@@ -82,6 +94,12 @@ markResolved(workspaceRoot, sessionId):     # called by extension on EXPLICIT us
   resolved=true
 ```
 
+**Primary vs trailer (the rule that guarantees exactly one notification per attention point).** Empirically (instrumented 2026-05-29), every attention point is announced by a PRIMARY event — `Stop` (completion) or `PermissionRequest`/`PreToolUse` (a new question / tool request; **every `AskUserQuestion` fires its own `PermissionRequest`**). A bare `Notification` is ALWAYS a trailer or a "still waiting" re-fire of the primary that already notified ("Claude is waiting for your input" / "Claude needs your permission"). So a `Notification` never escapes the burst window — it is always suppressed — while a primary arriving after the window is a genuinely new point and notifies. This guarantees **at least one** notification per question/completion and **at most one** (trailers and late re-fires collapse).
+
+This also sidesteps the upstream `AskUserQuestion` limitation: Claude Code's `AskUserQuestion` does NOT fire `PreToolUse`/`PostToolUse` ([anthropics/claude-code#15872](https://github.com/anthropics/claude-code/issues/15872)), AND **answering a question does not emit `UserPromptSubmit`** (confirmed empirically), so there is no ack hook to advance the stage between back-to-back questions. We don't need one: each question's own `PermissionRequest` is the new-attention-point signal, so it notifies via the primary-escape branch. `STAGE_ESCAPE_VALVE_MS = 3000` is just the burst window (collapses the ~100ms–2s platform pair and the lock-ordering race); it no longer decides "new vs re-fire" by time.
+
+**If #15872 ships** (PostToolUse fires for AskUserQuestion): nothing is forced to change — the primary/trailer rule already works. Optionally, a `PostToolUse` hook calling `advanceOnPrompt` would let the burst window shrink, but it is no longer required.
+
 **Important — what counts as an "ack" for `markResolved`:** Focus-Terminal toast click,
 OS-banner click. The "Already on correct terminal" sound-only path **does not** call
 `markResolved`; doing so would prematurely re-open the gate and let the immediate
@@ -89,6 +107,22 @@ follow-up event in the same stage (e.g. Notification right after Stop) re-fire a
 duplicate sound. v3.3.1 fixed exactly this regression.
 
 The unit tests in `test/stage-dedup.test.js` are the authoritative spec — if you change the state machine, update the tests and verify they still describe the intended behavior.
+
+### Terminal-matching tiers (`lib/terminal-match.js`)
+
+When the extension needs to pick *which* VS Code terminal a Claude signal belongs to (Case-A "are you already on the right terminal?" check, Focus-Terminal toast click, OS-banner click), it runs through these tiers in order. The first tier that matches **exactly one** terminal wins; ambiguous tiers (matching 0 or 2+) fall through.
+
+```
+1. pid               — terminal.processId is signal.shellPid OR appears in signal.pids
+2. cwd               — terminal.shellIntegration.cwd equals (or is under) signal.workspaceRoot / projectDir
+3. claude-marker     — terminal name contains ✳, ⚒, ▣, ✻, "claude", or the project basename (≥ 4 chars)
+4. non-default-name  — exactly one terminal has a name not in {bash, powershell, pwsh, cmd, zsh, sh, fish, ...}
+5. (none)            — return null. NO "last terminal" fallback — switching to a random shell is worse than not switching.
+```
+
+Why this exists: on Windows + Git Bash, `terminal.processId` returns a launcher PID that is *not* an ancestor of `node hook.js` (MSYS2 fork model / winpty / ConPTY indirection break the link), so the PID tier silently misses. The cwd and Claude-marker tiers are the recovery path — Claude Code writes its title via ANSI escapes (`✳` busy / `⚒` tool / project basename idle), so any terminal hosting Claude has a distinctive name we can match against.
+
+The PID chain is built in `hook.js#getPidChain` from a single `lib/process-tree.snapshot()` call (one `Get-CimInstance` on Windows, one `ps -A` on POSIX) rather than per-PID subprocesses. The hook also writes a short diagnostic line to stderr — Claude Code captures hook stderr to its hook log, so future "wrong terminal" reports give us `chain depth=… source=… shellPid=… tip=…` without instrumentation.
 
 ### Notification ownership invariant
 
@@ -204,9 +238,11 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 | Duplicate banners | `~/.claude/focus-state/<hash>/sessions` — is `resolved` getting set on ack? Read `extension.js` ack paths. Re-check `stage-dedup.js#shouldNotify`. |
 | No banners at all | `~/.claude/settings.json` hook entries (`hooks.Stop[*].hooks[*].command` should point at `dist/hook.js`). Then check `hook.js` for early-exits (muted, event disabled, dedup suppressed). |
 | Wrong terminal focused | "Claude Notifications" Output channel. Look for `pids=[...]` and `Active terminal after switch`. The PID match logic is in `extension.js#focusMatchingTerminal`. |
+| Windows OS-banner click does nothing / opens unexpected window | `reg query "HKCU\Software\Classes\claude-notif\shell\open\command"` — does it exist and point at `%LOCALAPPDATA%\claude-notifications\win-click-handler.js`? Then check the "Claude Notifications" Output channel for `Windows click-handler registered:` at activation. If registration failed (e.g. node not on PATH at activation time), the OS-banner click reverts to no-op. The launcher is rewritten + the registry re-registered on every activation, so a VS Code reload usually self-heals. |
 | Wrong terminal after OS-banner click | Look for `Click-to-focus [marker]` vs `[signal-fallback]` in the log. `[marker]` should be the common path. `[signal-fallback]` means the click marker was empty/stale/corrupt — the per-workspace signal file is shared and may point at a sibling session. The marker payload itself is built in `hook.js` (terminal-notifier `-execute`) and parsed by `lib/click-marker.js`. |
 | "Already on correct terminal" duplicate sound | The auto-correct-terminal path in `extension.js` MUST NOT call `markResolved`. If it does, the next event in the same stage (Stop→Notification) will re-fire because `shouldNotify` sees `resolved=true` and bumps to a new stage. See v3.3.1 fix. |
-| Hook never fires | `~/.claude/settings.json` — was the hook installed? Did the user restart their `claude` session after install? |
+| Hook never fires | `~/.claude/settings.json` — was the hook installed? Should point at `~/.claude/claude-notifications/hook.cjs` (wrapper), not at the extension dir directly. Did the user restart their `claude` session after install? |
+| `MODULE_NOT_FOUND` errors in Claude after uninstall | Should be impossible as of 3.5.0 — the wrapper self-destructs on first fire after extension removal. If it does happen, the wrapper itself was deleted before it could self-clean. Manual remedy: run the cleanup steps from `cmdUninstall` in `extension.js` (uninstallHooks + uninstallHookRuntime + uninstallWinProtocol + rm focus-state). |
 | Build error | `node esbuild.js` output. Most often a require pointing at a deleted file — grep the `lib/` tree. |
 | Marketplace install error | `extensionDependencies` resolution. See publish checklist. |
 

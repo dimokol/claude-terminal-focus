@@ -20,6 +20,7 @@ const path = require('path');
 const { execSync, execFile, spawn } = require('child_process');
 const os = require('os');
 const { setTimeout: sleep } = require('node:timers/promises');
+const { pathToFileURL } = require('node:url');
 const { claimHandled, eventPriority } = require('./lib/signals');
 const {
   getStateDir,
@@ -29,6 +30,21 @@ const {
 } = require('./lib/state-paths');
 const { shouldNotify: checkShouldNotify } = require('./lib/stage-dedup');
 const { buildClickMarkerPayload } = require('./lib/click-marker');
+const { readAiTitle } = require('./lib/transcript-title');
+const { snapshot: processSnapshot, walkUp } = require('./lib/process-tree');
+const { schemeForBinaryName, classifyBuild } = require('./lib/code-build');
+
+// Process names we consider "the interactive shell hosting Claude". The
+// first ancestor matching one of these is recorded as signal.shellPid —
+// the extension prefers it over the raw pid list when matching terminals.
+const SHELL_PROCESS_NAMES = new Set([
+  'bash.exe', 'sh.exe', 'zsh.exe', 'pwsh.exe', 'powershell.exe',
+  'cmd.exe', 'fish.exe', 'wsl.exe',
+  // POSIX (no .exe), as reported by `ps -o comm=`. Includes the
+  // login-shell '-' prefix variants.
+  'bash', '-bash', 'sh', '-sh', 'zsh', '-zsh', 'pwsh', 'powershell',
+  'fish', '-fish'
+]);
 
 const CONFIG_FILE = 'claude-notifications-config.json';
 const DEFAULT_HANDSHAKE_MS = 1200;
@@ -36,6 +52,37 @@ const DEFAULT_HANDSHAKE_MS = 1200;
 // Shell-escape a single argument (POSIX single-quote style).
 function shEsc(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+// Build the spawn argv for a hidden PowerShell that escapes Claude Code's
+// hook job object. Prefer the wscript+hide.vbs wrapper (no console flash);
+// fall back to plain `cmd /c start /B powershell` (brief flash, but never
+// the blocking "Windows Script Host: can not find script file" dialog) when
+// hide.vbs is missing.
+function buildHiddenPsArgv(tmpScript) {
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  const hideVbsPath = path.join(localAppData, 'claude-notifications', 'hide.vbs');
+  const psTail = [
+    'powershell.exe',
+    '-NoProfile', '-NonInteractive',
+    '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+    '-File', tmpScript
+  ];
+  let useVbs = false;
+  try { useVbs = fs.existsSync(hideVbsPath); } catch (_) { useVbs = false; }
+  if (useVbs) {
+    return ['/c', 'start', '""', '/B', 'wscript.exe', hideVbsPath, ...psTail];
+  }
+  return ['/c', 'start', '""', '/B', ...psTail];
+}
+
+function xmlEsc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
 
 (async () => {
@@ -48,16 +95,29 @@ function shEsc(s) {
   let hookEventName = '';
   let hookMessage = '';
   let sessionId = '';
+  let transcriptPath = '';
   try {
     const stdinData = fs.readFileSync(0, 'utf8');
     const input = JSON.parse(stdinData);
     hookEventName = input.hook_event_name || '';
     hookMessage = typeof input.message === 'string' ? input.message : '';
     sessionId = input.session_id || '';
+    transcriptPath = typeof input.transcript_path === 'string' ? input.transcript_path : '';
     const eventName = hookEventName.toLowerCase();
     if (eventName === 'stop') hookEvent = 'completed';
     else hookEvent = 'waiting'; // notification, permissionrequest, etc.
   } catch (_) {}
+
+  // aiTitle: best-effort. Missing transcript / no ai-title record / parse
+  // error → '', and we fall back to project-only notification text.
+  const MAX_TITLE_LEN = 60; // macOS subtitle truncates around here; keep banners readable.
+  let aiTitle = '';
+  if (transcriptPath) {
+    const raw = readAiTitle(transcriptPath);
+    if (raw) {
+      aiTitle = raw.length > MAX_TITLE_LEN ? raw.slice(0, MAX_TITLE_LEN - 1) + '…' : raw;
+    }
+  }
 
   // --- 2. Read config (mute state, sound/event preferences) ---
 
@@ -103,54 +163,61 @@ function shEsc(s) {
   // unresolved stage. Stage advances on event-type change, on previous
   // stage being resolved (user ack), or on UserPromptSubmit (handled by
   // hook-user-prompt.js). See lib/stage-dedup.js for the full state machine.
-  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent);
+  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent, hookEventName);
   if (!dedup.notify) {
     process.exit(0);
   }
 
   // --- 4. Build PID ancestor chain ---
+  //
+  // One process-tree snapshot, then a pure JS walk up from process.pid.
+  // Previously we ran one `wmic`/`ps` subprocess per ancestor; on Windows
+  // that was slow, silently broke (catch + break with no logging), and
+  // `wmic` is being removed from modern Windows installs entirely.
+  //
+  // The walk also records process *names* so the extension can identify
+  // which pid is the actual shell (bash.exe / pwsh.exe / cmd.exe / ...).
+  // That's how we match terminals reliably for Git Bash, where
+  // `terminal.processId` from VS Code is not in the ancestor chain
+  // (MSYS2 fork model / launcher exits after spawning the real shell).
 
-  function getPidChain() {
-    const pids = [];
-    let currentPid = process.pid;
-
-    if (process.platform === 'win32') {
-      while (currentPid && currentPid > 0) {
-        pids.push(currentPid);
-        try {
-          const output = execSync(
-            `wmic process where ProcessId=${currentPid} get ParentProcessId /value`,
-            { encoding: 'utf8', timeout: 2000, stdio: ['pipe', 'pipe', 'pipe'] }
-          );
-          const match = output.match(/ParentProcessId=(\d+)/);
-          if (!match) break;
-          const parentPid = parseInt(match[1], 10);
-          if (parentPid === currentPid || parentPid === 0) break;
-          currentPid = parentPid;
-        } catch (_) { break; }
-      }
-    } else {
-      while (currentPid && currentPid > 1) {
-        pids.push(currentPid);
-        try {
-          const output = execSync(`ps -o ppid= -p ${currentPid}`, {
-            encoding: 'utf8', timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
-          });
-          const parentPid = parseInt(output.trim(), 10);
-          if (isNaN(parentPid) || parentPid <= 0 || parentPid === currentPid) break;
-          currentPid = parentPid;
-        } catch (_) { break; }
-      }
-    }
-    return pids;
+  const snap = processSnapshot();
+  const chain = walkUp(snap, process.pid);
+  const pids = chain.map(n => n.pid);
+  const pidNames = {};
+  for (const node of chain) {
+    if (node.name) pidNames[String(node.pid)] = node.name;
   }
+  // First ancestor whose process name looks like an interactive shell.
+  // This is what the extension uses for primary terminal matching.
+  // Names may arrive as a full path (POSIX `ps -o comm=` on macOS returns
+  // '/bin/zsh') or as a bare executable (Windows: 'bash.exe'), so we
+  // normalize to a lowercase basename before checking.
+  let shellPid = 0;
+  for (const node of chain) {
+    if (!node.name) continue;
+    const base = node.name.toLowerCase().replace(/^.*[/\\]/, '').replace(/^-/, '');
+    if (SHELL_PROCESS_NAMES.has(base)) {
+      shellPid = node.pid;
+      break;
+    }
+  }
+
+  // Diagnostics — Claude Code captures hook stderr to its hook log.
+  // One line, terse, parseable. Surfaces when snapshot acquisition fails
+  // (the most common cause of future Windows reports).
+  try {
+    const tip = chain.length > 0 ? chain[chain.length - 1] : null;
+    const tipDesc = tip ? `pid=${tip.pid} name=${tip.name || '?'}` : 'empty-chain';
+    process.stderr.write(
+      `claude-notifications: chain depth=${chain.length} source=${snap.source} shellPid=${shellPid || 'none'} tip=${tipDesc}\n`
+    );
+  } catch (_) {}
 
   // --- 5. Write signal file ---
   // If another hook (for a concurrent event) already wrote a signal with a
   // higher-priority event, preserve it. This makes "waiting" (user action
   // required) win over "completed" (just-finished) when both fire together.
-
-  const pids = getPidChain();
   let shouldWriteSignal = true;
   try {
     const existing = JSON.parse(fs.readFileSync(signalPath, 'utf8'));
@@ -174,7 +241,11 @@ function shEsc(s) {
       projectDir: projectDir,
       workspaceRoot: workspaceRoot,
       pids,
+      pidNames,
+      shellPid: shellPid || undefined,
+      pidChainSource: snap.source,
       state: 'pending',
+      aiTitle,
       timestamp: Date.now()
     };
     fs.writeFileSync(signalPath, JSON.stringify(signalPayload, null, 2));
@@ -244,33 +315,62 @@ function shEsc(s) {
     const fileToPlay = soundPath || path.join(path.dirname(__filename), 'sounds', `${eventInfo.sound}.wav`);
 
     if (volume > 0 && fs.existsSync(fileToPlay)) {
+      // CRITICAL: every sound subprocess is launched detached + unref'd.
+      // execFile(..., callback) keeps the parent alive until the child
+      // closes its stdio, which on Windows meant PowerShell cold-start +
+      // WPF MediaPlayer + WAV duration kept Claude Code's Stop hook
+      // hanging for multiple seconds per message — and if PS hung at
+      // the (since-fixed) NaturalDuration polling loop, it hung forever.
+      // The hook MUST return control to Claude immediately; the sound
+      // plays in its own detached process.
       try {
         if (process.platform === 'darwin') {
           const vol = (volume / 100).toFixed(3);
-          execFile('afplay', ['-v', vol, fileToPlay], () => {});
+          const child = spawn('afplay', ['-v', vol, fileToPlay], {
+            detached: true, stdio: 'ignore'
+          });
+          child.unref();
         } else if (process.platform === 'win32') {
-          const esc = fileToPlay.replace(/'/g, "''");
+          const fileUri = pathToFileURL(fileToPlay);
           const vol = (volume / 100).toFixed(3);
           const psCmd = `
             try {
               Add-Type -AssemblyName PresentationCore -ErrorAction Stop
               $p = New-Object System.Windows.Media.MediaPlayer
-              $p.Open([System.Uri]::new('${esc}', [System.UriKind]::Absolute))
+              $p.Open([System.Uri]'${fileUri}')
               $p.Volume = ${vol}
-              while (-not $p.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 20 }
-              $ms = [int]$p.NaturalDuration.TimeSpan.TotalMilliseconds + 150
+              $deadline = (Get-Date).AddSeconds(3)
+              while (-not $p.NaturalDuration.HasTimeSpan -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 20
+              }
+              if ($p.NaturalDuration.HasTimeSpan) {
+                $ms = [int]$p.NaturalDuration.TimeSpan.TotalMilliseconds + 150
+              } else { $ms = 1500 }
               $p.Play()
               Start-Sleep -Milliseconds $ms
               $p.Close()
             } catch {
-              (New-Object System.Media.SoundPlayer '${esc}').PlaySync()
+              try { (New-Object System.Media.SoundPlayer '${fileToPlay.replace(/'/g, "''")}').PlaySync() } catch {}
             }`.trim();
-          execFile('powershell', ['-NoProfile', '-Command', psCmd], () => {});
+          // Same job-escape + no-flash chain as the toast spawn (see the
+          // big Windows-toast block below for the full rationale).
+          // Direct `spawn('powershell', ...)` got killed by Claude Code's
+          // hook job-object teardown → no sound. `cmd /c start /B` escapes
+          // the job; wscript+hide.vbs runs PS with intWindowStyle=0 so
+          // no console window allocation flash.
+          const tmpSoundScript = path.join(os.tmpdir(), `claude-sound-${Date.now()}-${process.pid}.ps1`);
+          const soundCleanup = `\ntry {} finally { Remove-Item -LiteralPath '${tmpSoundScript.replace(/'/g, "''")}' -Force -ErrorAction SilentlyContinue }`;
+          fs.writeFileSync(tmpSoundScript, '﻿' + psCmd + soundCleanup, 'utf8');
+          const child = spawn('cmd.exe', buildHiddenPsArgv(tmpSoundScript), {
+            detached: true, stdio: 'ignore', windowsHide: true
+          });
+          child.unref();
         } else {
           const paVol = String(Math.round((volume / 100) * 65536));
-          execFile('paplay', ['--volume', paVol, fileToPlay], (err) => {
-            if (err) execFile('aplay', [fileToPlay], () => {});
+          const child = spawn('sh', ['-c', `paplay --volume=${paVol} '${fileToPlay.replace(/'/g, "'\\''")}' || aplay '${fileToPlay.replace(/'/g, "'\\''")}'`], {
+            detached: true, stdio: 'ignore'
           });
+          child.unref();
         }
       } catch (_) {}
     }
@@ -302,54 +402,129 @@ function shEsc(s) {
       // multi-session workspaces focus whichever session wrote the signal
       // file last instead of the one whose banner the user actually clicked.
       const clickPayload = buildClickMarkerPayload({
-        sessionId, pids, event: hookEvent, project: projectName
+        sessionId, pids, shellPid, workspaceRoot, projectDir,
+        event: hookEvent, project: projectName, aiTitle
       });
       const executeCmd = `/usr/bin/printf '%s' ${shEsc(clickPayload)} > ${shEsc(clickedPath)} && ${shEsc(codeCli)} ${shEsc(workspaceRoot)}`;
-      const child = spawn('terminal-notifier', [
+      const notifierArgs = [
         '-title', eventInfo.title,
         '-message', eventInfo.message,
         '-execute', executeCmd,
         '-group', `claude-${projectName}`,
-      ], { detached: true, stdio: 'ignore' });
+      ];
+      if (aiTitle) {
+        notifierArgs.splice(2, 0, '-subtitle', aiTitle);
+      }
+      const child = spawn('terminal-notifier', notifierArgs, { detached: true, stdio: 'ignore' });
       child.unref();
     } catch (_) {
       try {
-        execSync(`osascript -e 'display notification "${eventInfo.message}" with title "${eventInfo.title}"'`, {
+        const osaTitle = aiTitle
+          ? `${eventInfo.title} — ${aiTitle.replace(/"/g, '\\"')}`
+          : eventInfo.title;
+        execSync(`osascript -e 'display notification "${eventInfo.message}" with title "${osaTitle}"'`, {
           timeout: 3000, stdio: 'ignore'
         });
       } catch (_) {}
     }
   } else if (process.platform === 'win32') {
-    // Why this is convoluted: an inline `powershell -Command <script>` launched
-    // via `spawn(..., {detached:true, stdio:'ignore'})` on Windows is *not*
-    // truly orphaned — it stays inside the parent's job object. When Claude
-    // Code's hook returns and tears down its process tree, the still-cold
-    // PowerShell child can get killed before WinRT's
-    // `ToastNotificationManager.CreateToastNotifier(...).Show(...)` finishes
-    // registering the toast with the OS — sound has already fired (hook.js
-    // owns that), but the banner never appears and the toast doesn't even
-    // land in Action Center.
+    // ── Windows toast firing chain ──
     //
-    // The proven pattern (also what the v2 PS1 setup used) is:
-    //   1. Drop the script to a temp .ps1 file.
-    //   2. Launch via `cmd /c start "" /B powershell.exe -File <tmp>` —
-    //      `start` allocates a fresh process group / detaches from the
-    //      parent's job, so the toast survives the hook tearing down.
-    //   3. End the script with a small `Start-Sleep` so the WinRT call has
-    //      headroom to complete before the spawned PowerShell exits.
-    //   4. Self-delete the temp file at the end of the script (own cleanup,
-    //      no orphan files in %TEMP%).
-    const vscodePath = workspaceRoot.replace(/\\/g, '/');
-    const vscodeUri = `vscode://file/${vscodePath}`;
+    // Two problems combine here, each ruling out the "obvious" solution
+    // to the other:
+    //
+    // 1. Claude Code's hook subsystem owns a Windows JOB OBJECT with
+    //    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set. When our hook returns,
+    //    Claude closes its handle to that job and every process inside
+    //    dies — INCLUDING our still-cold toast PowerShell that hasn't
+    //    yet reached `ToastNotificationManager.Show()`. Result: silently
+    //    no toast.
+    //
+    //    Empirically (Ada 2026-05-21 + dimokol 2026-05-23 live-tests),
+    //    the only working escape on this Claude Code build is to spawn
+    //    via `cmd /c start "" /B <target>`. The `start` builtin allocates
+    //    a fresh process group that breaks away from the inherited job,
+    //    so the PowerShell child survives. We tried Node's
+    //    `windowsCreateProcessFlags: ['CREATE_BREAKAWAY_FROM_JOB', ...]`
+    //    (3.5.4); spawn doesn't throw but BREAKAWAY is silently ineffective
+    //    on Claude Code's job (probably JOB_OBJECT_LIMIT_BREAKAWAY_OK
+    //    isn't set, but the failure is async and uncatchable), so the
+    //    cmd/start fallback was never invoked — toast just disappeared.
+    //
+    // 2. Plain `cmd /c start "" /B powershell.exe ...` flashes a console
+    //    window briefly before `-WindowStyle Hidden` takes effect, because
+    //    `start /B` can't inherit the hidden cmd's (non-existent) console
+    //    and the OS allocates a fresh one. Ada called this "PowerShell
+    //    flash"; this tester called it a "desktop refresh".
+    //
+    // Solution: chain `cmd /c start /B` (job escape) + `wscript.exe hide.vbs`
+    // (silent launcher used elsewhere by the click handler) + `powershell.exe`.
+    // hide.vbs calls `WScript.Shell.Run(cmd, 0, False)` with intWindowStyle=0,
+    // which passes hidden-window flags to CreateProcess BEFORE PowerShell
+    // starts — no window is ever allocated, nothing to flash.
+    //
+    // ── Toast launch URI ──
+    //
+    // Uses `<product-scheme>://dimokol.claude-notifications/click?marker=<base64>`,
+    // where product-scheme matches the VS Code build the Claude session is
+    // running in: vscode for Stable, vscode-insiders for Insiders, and
+    // vscodium / cursor / windsurf for the common forks. We detect the build
+    // from the PID ancestor chain (the owning Code binary basename) via
+    // lib/code-build. This matters because Windows routes a bare `vscode://`
+    // to whichever build OWNS that scheme (almost always Stable), so an
+    // Insiders user clicking a vscode:// toast gets a fresh Stable window
+    // instead of their Insiders instance (GitHub #4). Each build's
+    // registerUriHandler answers its own product scheme automatically, so no
+    // extension-side change is needed; we just emit the matching scheme.
+    //
+    // VS Code routes activations matching an installed extension's id to that
+    // extension's registerUriHandler callback, so clicking the toast lands
+    // directly in our extension code with the marker payload in the URI, no
+    // file mediation.
+    //
+    // Why not the simpler `vscode://file/<workspace>`? It works for opening
+    // the workspace but carries no per-session info — terminal switching on
+    // click would require a preemptive marker write, which the extension's
+    // polling loop picks up regardless of whether the user actually clicked
+    // (caught in 2026-05-23 live-test: terminal switched in VS Code while it
+    // was unfocused behind another app, before any click happened).
+    //
+    // Why not the custom `claude-notif://` we register in HKCU? Direct
+    // shell activation works (Start-Process invokes the handler) but the
+    // Windows toast body-click activation pipeline silently drops custom
+    // schemes for our AUMID (`Microsoft.Windows.Shell.RunDialog`). Tested
+    // 2026-05-23: both body-click and an explicit `<action
+    // activationType="protocol">` button were no-ops. The vscode:// route
+    // goes through VS Code's published-extension URI handler instead, which
+    // is reliable.
     const tmpScript = path.join(os.tmpdir(), `claude-notif-${Date.now()}-${process.pid}.ps1`);
+    const titleLine = aiTitle ? `    <text>${xmlEsc(aiTitle)}</text>` : '';
+    const clickMarkerJson = buildClickMarkerPayload({
+      sessionId, pids, shellPid, workspaceRoot, projectDir,
+      event: hookEvent, project: projectName, aiTitle
+    });
+    const clickMarkerB64 = Buffer.from(clickMarkerJson, 'utf8').toString('base64');
+    // Pick the launch scheme that matches the owning VS Code build (#4).
+    // Walk the PID chain for the first VS-Code-flavored ancestor and use its
+    // product scheme; fall back to vscode:// when none is found (e.g. Claude
+    // run from a plain terminal outside any VS Code window).
+    let launchScheme = 'vscode';
+    for (const node of chain) {
+      if (node && node.name && classifyBuild(node.name)) {
+        launchScheme = schemeForBinaryName(node.name);
+        break;
+      }
+    }
+    const toastLaunchUri = `${launchScheme}://dimokol.claude-notifications/click?marker=${encodeURIComponent(clickMarkerB64)}`;
     const psScriptBody = `
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
 $template = @"
-<toast activationType="protocol" launch="${vscodeUri}" duration="long">
+<toast activationType="protocol" launch="${xmlEsc(toastLaunchUri)}" duration="long">
   <visual><binding template="ToastGeneric">
-    <text>${eventInfo.title}</text>
-    <text>${eventInfo.message}</text>
+    <text>${xmlEsc(eventInfo.title)}</text>
+${titleLine}
+    <text>${xmlEsc(eventInfo.message)}</text>
   </binding></visual>
   <audio src="ms-winsoundevent:Notification.Default" silent="true" />
 </toast>
@@ -365,16 +540,11 @@ try {
 }
 `;
     try {
-      fs.writeFileSync(tmpScript, psScriptBody, 'utf8');
-      const child = spawn('cmd.exe', [
-        '/c', 'start', '""', '/B',
-        'powershell.exe',
-        '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-        '-File', tmpScript
-      ], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true
+      // BOM so Windows PowerShell 5.1 reads the .ps1 as UTF-8 instead of
+      // CP1252 — without it, the em-dash in titles becomes "â€"".
+      fs.writeFileSync(tmpScript, '﻿' + psScriptBody, 'utf8');
+      const child = spawn('cmd.exe', buildHiddenPsArgv(tmpScript), {
+        detached: true, stdio: 'ignore', windowsHide: true
       });
       child.unref();
     } catch (_) {
@@ -390,4 +560,12 @@ try {
       child.unref();
     } catch (_) {}
   }
+
+  // CRITICAL: exit explicitly so Claude Code's hook handler returns
+  // immediately. All side-effect subprocesses above are spawned with
+  // detached + unref + stdio:'ignore', so they survive parent exit.
+  // Without this, Node would drain the event loop and any subprocess
+  // that's slow to release its handles (Windows PowerShell cold-start
+  // is the worst offender) would block Claude for seconds-to-minutes.
+  process.exit(0);
 })();

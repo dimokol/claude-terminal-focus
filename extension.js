@@ -26,7 +26,18 @@ const {
 } = require('./lib/state-paths');
 const { markResolved } = require('./lib/stage-dedup');
 const { parseClickMarker } = require('./lib/click-marker');
-const { checkHookStatus, checkAllProfiles, installHooks, uninstallHooks } = require('./lib/hooks-installer');
+const { matchTerminal } = require('./lib/terminal-match');
+const { checkHookStatus, checkAllProfiles, installHooks, uninstallHooks, discoverProfiles } = require('./lib/hooks-installer');
+const { installHookRuntime, uninstallHookRuntime, getWrapperHookPath, getWrapperUserPromptPath } = require('./lib/hook-runtime');
+
+let _wrapperPaths = null;
+function getWrapperPaths() {
+  // Even if installHookRuntime hasn't run (e.g. it failed), return the
+  // expected paths so callers don't crash. The wrapper just won't exist
+  // on disk in that degraded case.
+  if (_wrapperPaths) return _wrapperPaths;
+  return { hookPath: getWrapperHookPath(), userPromptHookPath: getWrapperUserPromptPath() };
+}
 const { playSound, playSoundFile, resolveSoundPath, discoverSystemSounds } = require('./lib/sounds');
 
 const POLL_MS = 400;
@@ -45,6 +56,47 @@ function activate(context) {
 
   // --- Detect legacy extension (primary cause of duplicate toasts) ---
   warnIfLegacyExtensionActive(context, log);
+
+  // --- Install / refresh the stable-location hook wrapper ---
+  // Hook entries in settings.json point at this wrapper rather than at
+  // the extension's dist/, so the hook contract survives uninstalls and
+  // upgrades. The wrapper self-destructs on its first fire after the
+  // extension is gone, cleaning every profile + Windows registry + state.
+  try {
+    const runtimeResult = installHookRuntime(context.extensionPath, {
+      extensionVersion: context.extension.packageJSON.version
+    });
+    if (runtimeResult.ok) {
+      _wrapperPaths = {
+        hookPath: runtimeResult.wrapperHookPath,
+        userPromptHookPath: runtimeResult.wrapperUserPromptPath
+      };
+      log.appendLine(`Hook runtime ready: ${runtimeResult.wrapperDir}`);
+    } else {
+      log.appendLine(`Hook runtime install failed (extension may produce stale hooks after uninstall): ${runtimeResult.error}`);
+    }
+  } catch (e) {
+    log.appendLine(`Hook runtime install threw: ${e.message}`);
+  }
+
+  // --- Windows: register claude-notif:// URI handler for OS-banner clicks ---
+  // Self-healing — every activation rewrites the HKCU keys with the current
+  // launcher and node paths, so reinstalls/updates don't leave orphans.
+  if (process.platform === 'win32') {
+    try {
+      const { installWinProtocol } = require('./lib/win-protocol');
+      const bundledLauncherPath = path.join(context.extensionPath, 'dist', 'win-click-handler.js');
+      const bundledHideVbsPath = path.join(context.extensionPath, 'dist', 'hide.vbs');
+      const result = installWinProtocol({ bundledLauncherPath, bundledHideVbsPath });
+      if (result.ok) {
+        log.appendLine(`Windows click-handler registered: launcher=${result.launcherPath} node=${result.nodeExe} hideVbs=${result.hideVbsPath || 'unavailable (will flash console window)'}`);
+      } else {
+        log.appendLine(`Windows click-handler registration failed (OS-banner click will fall back to no-op): ${result.error}`);
+      }
+    } catch (e) {
+      log.appendLine(`Windows click-handler registration threw: ${e.message}`);
+    }
+  }
 
   // --- Status bar ---
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -69,7 +121,26 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
     }),
     vscode.commands.registerCommand('claudeNotifications.chooseSound', (event) => cmdChooseSound(context, log, event)),
     vscode.commands.registerCommand('claudeNotifications.previewSound', () => cmdPreviewSound(context, log)),
-    vscode.commands.registerCommand('claudeNotifications.setupMacNotifier', () => cmdSetupMacNotifier(context, log))
+    vscode.commands.registerCommand('claudeNotifications.setupMacNotifier', () => cmdSetupMacNotifier(context, log)),
+    vscode.commands.registerCommand('claudeNotifications.uninstall', () => cmdUninstall(context, log))
+  );
+
+  // --- VS Code URI handler for OS-banner clicks (Windows + cross-platform) ---
+  //
+  // The Windows toast's `launch="vscode://dimokol.claude-notifications/click?marker=<b64>"`
+  // routes here when the user clicks. We get the click event in-extension —
+  // no marker file mediation, no race between preemptive write and polling
+  // loop pickup. This replaces the file-based clicked-marker approach on
+  // Windows (where the custom `claude-notif://` scheme silently fails to
+  // activate from toasts with our AUMID) AND avoids the side effect of the
+  // extension processing a preemptive marker before the user actually
+  // clicks (e.g. terminal switching unexpectedly while VS Code is in the
+  // background). macOS continues to use terminal-notifier's `-execute`
+  // marker write, which is its native click delivery mechanism.
+  context.subscriptions.push(
+    vscode.window.registerUriHandler({
+      handleUri: (uri) => handleVsCodeUriClick(uri, log)
+    })
   );
 
   // --- Signal file watcher (polling at 400ms) ---
@@ -162,6 +233,7 @@ async function handleSignal(signalPath, workspaceRoot, log) {
   const rawEvent = signal.hookEventName || '?';
   const sessionTag = signal.sessionId ? signal.sessionId.slice(0, 8) : '?';
   log.appendLine(`Signal: event=${signal.event}(${rawEvent}), session=${sessionTag}, project=${signal.project}, pids=[${signal.pids.join(',')}], version=${signal.version}`);
+  if (signal.aiTitle) log.appendLine(`  title: ${signal.aiTitle}`);
   if (signal.hookMessage) log.appendLine(`  message: ${signal.hookMessage}`);
 
   const config = readConfig();
@@ -209,38 +281,142 @@ async function handleSignal(signalPath, workspaceRoot, log) {
   // causing a duplicate sound for the very next event in the same stage.
   // markResolved stays reserved for explicit user acknowledgment (Focus
   // Terminal click, OS banner click).
+  // Match against ALL terminals in this window, not just the active one.
+  // The matcher's job is "which terminal does this signal belong to?" —
+  // restricting to the active terminal causes false positives when the
+  // user has multiple Claude sessions in the same workspace: tier=cwd
+  // matches any terminal sharing the workspace dir, so an active sibling
+  // terminal would erroneously be reported as "correct" and the user
+  // would get sound-only instead of the visible Focus-Terminal toast
+  // they expected. Running against all terminals and then comparing the
+  // match's index to the active index gives us three distinct outcomes
+  // (active matches → sound only, different terminal matches → toast,
+  // no match → toast) instead of two (matches → sound only, doesn't →
+  // toast).
   const activeTerminal = vscode.window.activeTerminal;
-  if (activeTerminal) {
-    try {
-      const activePid = await activeTerminal.processId;
-      if (activePid && signal.pids.includes(activePid)) {
-        log.appendLine('Already on correct terminal — sound only (dedup will suppress same-stage re-fires)');
-        const soundWhenFocused = vscode.workspace.getConfiguration('claudeNotifications').get('soundWhenFocused', 'sound');
-        if (soundWhenFocused === 'sound' && wantSound) {
-          playEventSound(signal.event, config);
-        }
-        return;
+  try {
+    const allTerminals = vscode.window.terminals;
+    const allDescs = await Promise.all(
+      allTerminals.map((t, i) => describeTerminalForMatch(t, i))
+    );
+    log.appendLine(`Open terminals (${allDescs.length}): ${allDescs.map(d => `[${d.index}]"${d.name}"(pid=${d.pid},cwd=${d.cwd || '?'})`).join(', ')}`);
+    const m = matchTerminal(allDescs, signal);
+    const activeIndex = activeTerminal ? allTerminals.indexOf(activeTerminal) : -1;
+    if (m && m.index === activeIndex) {
+      const cfg = vscode.workspace.getConfiguration('claudeNotifications');
+      const soundWhenFocused = cfg.get('soundWhenFocused', 'sound');
+      const toastWhenFocused = cfg.get('toastWhenFocused', false);
+      log.appendLine(`Already on correct terminal — sound=${soundWhenFocused === 'sound' && wantSound ? 'on' : 'off'} toast=${toastWhenFocused && wantToast ? 'on' : 'off'} (tier=${m.tier}, ${m.reason})`);
+      if (soundWhenFocused === 'sound' && wantSound) {
+        playEventSound(signal.event, config);
       }
-    } catch (_) {}
+      if (toastWhenFocused && wantToast) {
+        // Info-only toast. We deliberately do NOT include a "Focus
+        // Terminal" action — the matcher already confirmed they're on
+        // the right terminal, so the button would be a no-op. VS Code
+        // auto-dismisses info popups without actions after a few
+        // seconds. Same dedup invariant applies: do not call
+        // markResolved here either; this is not an explicit user ack.
+        const baseMsg = signal.event === 'completed'
+          ? `Task completed in: ${signal.project}`
+          : `Waiting for your response in: ${signal.project}`;
+        const msg = signal.aiTitle ? `${baseMsg} — ${signal.aiTitle}` : baseMsg;
+        vscode.window.showInformationMessage(msg);
+      }
+      return;
+    }
+    if (m) {
+      log.appendLine(`Match found on a non-active terminal [${m.index}] — falling through to Focus Terminal toast (tier=${m.tier}, ${m.reason})`);
+    } else {
+      log.appendLine('No terminal in this window matched the signal — falling through to Focus Terminal toast');
+    }
+  } catch (e) {
+    log.appendLine(`Terminal-match threw: ${e && e.message ? e.message : String(e)} — falling through to Focus Terminal toast`);
   }
 
   // Case B: focused + wrong terminal → sound + "Focus Terminal" toast.
   if (wantSound) playEventSound(signal.event, config);
 
   if (wantToast) {
-    const action = await vscode.window.showInformationMessage(
-      signal.event === 'completed'
-        ? `Task completed in: ${signal.project}`
-        : `Waiting for your response in: ${signal.project}`,
-      'Focus Terminal'
-    );
+    const baseMsg = signal.event === 'completed'
+      ? `Task completed in: ${signal.project}`
+      : `Waiting for your response in: ${signal.project}`;
+    const msg = signal.aiTitle ? `${baseMsg} — ${signal.aiTitle}` : baseMsg;
+    const action = await vscode.window.showInformationMessage(msg, 'Focus Terminal');
 
     if (action === 'Focus Terminal') {
       log.appendLine('User clicked Focus Terminal');
-      await focusMatchingTerminal(signal.pids, log);
+      await focusMatchingTerminal(signal, log);
       markResolved(workspaceRoot, signal.sessionId);
     }
   }
+}
+
+/**
+ * Handle a vscode://dimokol.claude-notifications/click?marker=<b64> URI
+ * activation. The Windows toast's launch attribute routes through here on
+ * banner click — no file mediation, just the marker payload in the URI.
+ *
+ * Mirrors handleClickedSignal's marker-driven branch (decode → build target
+ * → focusMatchingTerminal → markResolved) but takes the marker straight
+ * from the query string instead of reading the clicked file.
+ */
+async function handleVsCodeUriClick(uri, log) {
+  let markerB64 = '';
+  try {
+    const q = (uri.query || '').split('&').find(p => p.startsWith('marker='));
+    if (q) markerB64 = decodeURIComponent(q.slice('marker='.length));
+  } catch (_) {}
+  if (!markerB64) {
+    log.appendLine('URI click: no marker query param — ignoring');
+    return;
+  }
+  let payload;
+  try {
+    const json = Buffer.from(markerB64, 'base64').toString('utf8');
+    payload = JSON.parse(json);
+  } catch (e) {
+    log.appendLine(`URI click: marker decode failed — ${e.message}`);
+    return;
+  }
+  if (!payload || !Array.isArray(payload.pids) || payload.pids.length === 0) {
+    log.appendLine('URI click: marker missing pids — cannot match terminal');
+    return;
+  }
+
+  const target = {
+    sessionId: payload.sessionId || '',
+    pids: payload.pids,
+    shellPid: payload.shellPid || 0,
+    workspaceRoot: payload.workspaceRoot || '',
+    projectDir: payload.projectDir || '',
+    event: payload.event || 'waiting',
+    project: payload.project || 'Claude Code',
+    aiTitle: payload.aiTitle || '',
+    source: 'uri'
+  };
+
+  // Resolve workspace root for marker cleanup paths (best effort).
+  const workspaceRoot = target.workspaceRoot ||
+    (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0]?.uri.fsPath) || '';
+  if (workspaceRoot) {
+    try { fs.unlinkSync(getClickedPath(workspaceRoot)); } catch (_) {}
+    try { fs.unlinkSync(getSignalPath(workspaceRoot)); } catch (_) {}
+    try { fs.unlinkSync(getClaimedPath(workspaceRoot)); } catch (_) {}
+  }
+
+  const sessionTag = target.sessionId ? target.sessionId.slice(0, 8) : '?';
+  const titleSuffix = target.aiTitle ? `, title="${target.aiTitle}"` : '';
+  log.appendLine(`Click-to-focus [uri] — event=${target.event}, session=${sessionTag}, project=${target.project}, pids=[${target.pids.join(',')}]${titleSuffix}`);
+  await focusMatchingTerminal(target, log);
+  if (workspaceRoot && target.sessionId) markResolved(workspaceRoot, target.sessionId);
+  // NOTE: We deliberately do NOT try to bring VS Code's window to the
+  // foreground here. On Windows, a toast click runs with ShellExperienceHost
+  // as the foreground window, which the OS shields — no SetForegroundWindow /
+  // AttachThreadInput / keystroke trick can raise a window over it from a
+  // background process (documented MS limitation; see
+  // docs/windows-banner-focus-handoff.md for the full investigation). The
+  // taskbar flashes; clicking it brings VS Code up already on the right tab.
 }
 
 /**
@@ -265,7 +441,7 @@ async function handleClickedSignal(workspaceRoot, log) {
     clickPayload = parseClickMarker(content);
   } catch (_) {}
 
-  let target = null; // { sessionId, pids, event, project, source }
+  let target = null; // pseudo-signal { sessionId, pids, shellPid, workspaceRoot, projectDir, event, project, source }
   if (clickPayload && !clickPayload.legacy && !clickPayload.stale && clickPayload.pids && clickPayload.pids.length > 0) {
     target = { ...clickPayload, source: 'marker' };
   } else {
@@ -283,8 +459,12 @@ async function handleClickedSignal(workspaceRoot, log) {
       target = {
         sessionId: signal.sessionId,
         pids: signal.pids,
+        shellPid: signal.shellPid || 0,
+        workspaceRoot: signal.workspaceRoot || '',
+        projectDir: signal.projectDir || '',
         event: signal.event,
         project: signal.project,
+        aiTitle: signal.aiTitle || '',
         source: 'signal-fallback'
       };
     }
@@ -301,8 +481,9 @@ async function handleClickedSignal(workspaceRoot, log) {
   }
 
   const sessionTag = target.sessionId ? target.sessionId.slice(0, 8) : '?';
-  log.appendLine(`Click-to-focus [${target.source}] — event=${target.event}, session=${sessionTag}, project=${target.project}, pids=[${target.pids.join(',')}]`);
-  await focusMatchingTerminal(target.pids, log);
+  const titleSuffix = target.aiTitle ? `, title="${target.aiTitle}"` : '';
+  log.appendLine(`Click-to-focus [${target.source}] — event=${target.event}, session=${sessionTag}, project=${target.project}, pids=[${target.pids.join(',')}]${titleSuffix}`);
+  await focusMatchingTerminal(target, log);
   markResolved(workspaceRoot, target.sessionId);
 }
 
@@ -389,42 +570,53 @@ async function describeTerminal(terminal, index) {
   return `[${index}]"${terminal.name}"(pid=${pid})`;
 }
 
-async function focusMatchingTerminal(pids, log) {
-  const terminals = vscode.window.terminals;
-  const descriptions = await Promise.all(terminals.map((t, i) => describeTerminal(t, i)));
-  log.appendLine(`Open terminals (${terminals.length}): ${descriptions.join(', ')}`);
-
-  for (let i = 0; i < terminals.length; i++) {
-    const terminal = terminals[i];
-    try {
-      const termPid = await terminal.processId;
-      if (termPid && pids.includes(termPid)) {
-        log.appendLine(`PID match: ${await describeTerminal(terminal, i)}`);
-        await showTerminal(terminal, log);
-        return;
-      }
-    } catch (_) {}
-  }
-
-  for (let i = 0; i < terminals.length; i++) {
-    const terminal = terminals[i];
-    const name = terminal.name.toLowerCase();
-    if (name.includes('claude') || name.includes('node')) {
-      log.appendLine(`Name match: ${await describeTerminal(terminal, i)}`);
-      await showTerminal(terminal, log);
-      return;
+/**
+ * Build the normalized terminal descriptor consumed by lib/terminal-match.
+ * Resolves processId and the shell-integration cwd (if available).
+ */
+async function describeTerminalForMatch(terminal, index) {
+  let pid = null;
+  try {
+    const resolved = await terminal.processId;
+    if (resolved) pid = resolved;
+  } catch (_) {}
+  let cwd = null;
+  try {
+    // shellIntegration is undefined when the user hasn't enabled it or the
+    // shell has not handshaked yet. cwd may be a vscode.Uri or string.
+    const si = terminal.shellIntegration;
+    if (si && si.cwd) {
+      cwd = typeof si.cwd === 'string' ? si.cwd : (si.cwd.fsPath || String(si.cwd));
     }
-  }
+  } catch (_) {}
+  return { index, name: terminal.name || '', pid, cwd };
+}
 
-  if (terminals.length > 0) {
-    const lastIndex = terminals.length - 1;
-    const lastTerminal = terminals[lastIndex];
-    log.appendLine(`Fallback: last terminal ${await describeTerminal(lastTerminal, lastIndex)}`);
-    await showTerminal(lastTerminal, log);
+/**
+ * Pick a terminal and `show()` it. Uses lib/terminal-match's tiered
+ * strategy (PID → cwd → Claude title markers → single non-default name).
+ * If no tier matches, intentionally does nothing — the previous
+ * "last terminal" fallback opened arbitrary shells (PowerShell when Claude
+ * was in Git Bash) and was worse than no action.
+ */
+async function focusMatchingTerminal(signal, log) {
+  const terminals = vscode.window.terminals;
+  if (terminals.length === 0) {
+    log.appendLine('No terminals open to focus');
     return;
   }
+  const descs = await Promise.all(terminals.map((t, i) => describeTerminalForMatch(t, i)));
+  const pretty = descs.map(d => `[${d.index}]"${d.name}"(pid=${d.pid || '?'}${d.cwd ? `,cwd=${d.cwd}` : ''})`);
+  log.appendLine(`Open terminals (${terminals.length}): ${pretty.join(', ')}`);
 
-  log.appendLine('No terminals found to focus');
+  const m = matchTerminal(descs, signal);
+  if (!m) {
+    log.appendLine('No confident terminal match — leaving terminal focus alone (workspace opened, but no terminal switch).');
+    return;
+  }
+  const terminal = terminals[m.index];
+  log.appendLine(`Match tier=${m.tier} — ${m.reason} → ${pretty[m.index]}`);
+  await showTerminal(terminal, log);
 }
 
 async function showTerminal(terminal, log) {
@@ -468,7 +660,7 @@ function writeConfig(config) {
 }
 
 function updateStatusBar(item, extensionPath) {
-  const { status } = checkHookStatus(extensionPath);
+  const { status } = checkHookStatus(getWrapperPaths().hookPath);
 
   if (status === 'not-installed' || status === 'no-file') {
     item.text = '$(gear) Claude: Set Up';
@@ -491,7 +683,8 @@ function updateStatusBar(item, extensionPath) {
 // --- Commands ---
 
 async function cmdSetupHooks(context, log) {
-  const { status } = checkHookStatus(context.extensionPath);
+  const wrapper = getWrapperPaths();
+  const { status } = checkHookStatus(wrapper.hookPath);
 
   if (status === 'installed') {
     vscode.window.showInformationMessage('Claude Notifications hooks are already installed.');
@@ -514,7 +707,7 @@ async function cmdSetupHooks(context, log) {
     if (choice !== 'Install') return;
   }
 
-  const result = installHooks(context.extensionPath, { replaceLegacy });
+  const result = installHooks(wrapper, { replaceLegacy });
 
   if (result.success) {
     log.appendLine(`Hooks installed. Backup: ${result.backupPath}`);
@@ -528,18 +721,27 @@ async function cmdSetupHooks(context, log) {
 }
 
 async function cmdRemoveHooks(log) {
+  const profiles = discoverProfiles();
+  const profileCount = profiles.length;
+  const label = profileCount > 1
+    ? `all ${profileCount} Claude profiles`
+    : '~/.claude/settings.json';
   const choice = await vscode.window.showWarningMessage(
-    'Remove Claude Notifications hooks from ~/.claude/settings.json?',
+    `Remove Claude Notifications hooks from ${label}?`,
     'Remove', 'Cancel'
   );
   if (choice !== 'Remove') return;
 
-  const result = uninstallHooks();
-  if (result.success) {
-    log.appendLine(result.message);
-    vscode.window.showInformationMessage(result.message);
+  let anyFailed = false;
+  for (const profilePath of profiles) {
+    const result = uninstallHooks(profilePath);
+    log.appendLine(`${profilePath}: ${result.message}`);
+    if (!result.success) anyFailed = true;
+  }
+  if (anyFailed) {
+    vscode.window.showErrorMessage('Claude Notifications: some profiles could not be cleaned — see Output channel for details.');
   } else {
-    vscode.window.showErrorMessage(result.message);
+    vscode.window.showInformationMessage(`Claude Notifications hooks removed from ${profileCount} profile(s).`);
   }
 }
 
@@ -608,6 +810,63 @@ async function promptMacNotifierSetup(context, log) {
   } else if (choice === "Don't Ask Again" || choice === 'Keep osascript') {
     await context.globalState.update('macNotifierPromptAnswered', true);
   }
+}
+
+async function cmdUninstall(context, log) {
+  const confirm = await vscode.window.showWarningMessage(
+    'Uninstall Claude Notifications: remove Claude Code hooks, click-handler registry key (Windows), and per-workspace state directories?',
+    { modal: true },
+    'Uninstall'
+  );
+  if (confirm !== 'Uninstall') return;
+
+  try {
+    const profiles = discoverProfiles();
+    for (const profilePath of profiles) {
+      uninstallHooks(profilePath);
+      // Clean the backup file installHooks leaves next to each settings.json.
+      try { fs.rmSync(profilePath + '.backup', { force: true }); } catch (_) {}
+    }
+    log.appendLine(`Uninstall: hooks removed from ${profiles.length} profile(s)`);
+  } catch (e) {
+    log.appendLine(`Uninstall: hooks removal failed — ${e.message}`);
+  }
+
+  try {
+    const r = uninstallHookRuntime();
+    log.appendLine(`Uninstall: hook runtime dir removed (${r.ok ? 'ok' : r.error})`);
+  } catch (e) {
+    log.appendLine(`Uninstall: hook runtime removal threw — ${e.message}`);
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const { uninstallWinProtocol, getLauncherDir } = require('./lib/win-protocol');
+      const r = uninstallWinProtocol();
+      log.appendLine(`Uninstall: registry key removed (${r.ok ? 'ok' : r.error})`);
+      try {
+        const dir = getLauncherDir();
+        fs.rmSync(dir, { recursive: true, force: true });
+        log.appendLine(`Uninstall: launcher dir removed (${dir})`);
+      } catch (e) {
+        log.appendLine(`Uninstall: launcher dir removal failed — ${e.message}`);
+      }
+    } catch (e) {
+      log.appendLine(`Uninstall: registry cleanup threw — ${e.message}`);
+    }
+  }
+
+  try {
+    const stateDir = path.join(os.homedir(), '.claude', 'focus-state');
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    log.appendLine(`Uninstall: state dir removed (${stateDir})`);
+  } catch (e) {
+    log.appendLine(`Uninstall: state dir removal failed — ${e.message}`);
+  }
+
+  vscode.window.showInformationMessage(
+    'Claude Notifications: cleanup complete. You can now safely uninstall the extension from the Extensions view.'
+  );
 }
 
 async function cmdSetupMacNotifier(context, log) {
@@ -707,8 +966,9 @@ async function autoFixAllProfiles(context, log) {
   const config = vscode.workspace.getConfiguration('claudeNotifications');
   const autoSetup = config.get('autoSetupHooks', true);
 
-  const results = checkAllProfiles(context.extensionPath);
-  const needsFix = results.filter(r => r.status === 'stale-path' || r.status === 'partial');
+  const wrapper = getWrapperPaths();
+  const results = checkAllProfiles(wrapper.hookPath);
+  const needsFix = results.filter(r => r.status === 'stale-path' || r.status === 'partial' || r.status === 'stale-config');
 
   if (needsFix.length === 0) return;
 
@@ -717,7 +977,7 @@ async function autoFixAllProfiles(context, log) {
   for (const profile of needsFix) {
     log.appendLine(`Profile needs fix: ${profile.path} (status=${profile.status}, installed=${profile.installedPath || 'n/a'})`);
     if (!autoSetup) continue;
-    const result = installHooks(context.extensionPath, { settingsPath: profile.path });
+    const result = installHooks(wrapper, { settingsPath: profile.path });
     if (result.success) {
       fixed.push(profile.path);
     } else {
@@ -729,8 +989,8 @@ async function autoFixAllProfiles(context, log) {
     log.appendLine(`Auto-fixed hook paths in ${fixed.length} profile(s): ${fixed.join(', ')}`);
     updateStatusBar(_statusBarItem, context.extensionPath);
     const summary = fixed.length === 1
-      ? `Claude Notifications: updated stale hook paths in ${path.basename(path.dirname(fixed[0]))}/settings.json.`
-      : `Claude Notifications: updated stale hook paths in ${fixed.length} Claude profiles. Restart any active 'claude' sessions for the change to take effect.`;
+      ? `Claude Notifications: updated hook configuration in ${path.basename(path.dirname(fixed[0]))}/settings.json. Restart any active 'claude' sessions for the change to take effect.`
+      : `Claude Notifications: updated hook configuration in ${fixed.length} Claude profiles. Restart any active 'claude' sessions for the change to take effect.`;
     vscode.window.showInformationMessage(summary);
   }
 
@@ -754,10 +1014,13 @@ async function autoFixAllProfiles(context, log) {
 //   false           — prompt before any modification of ~/.claude/settings.json.
 
 async function runFirstRunChecks(context, log, statusBarItem) {
-  const { status } = checkHookStatus(context.extensionPath);
+  const wrapper = getWrapperPaths();
+  const { status } = checkHookStatus(wrapper.hookPath);
   log.appendLine(`Hook status: ${status}`);
 
-  if (status === 'installed' || status === 'stale-path') return;
+  // 'stale-path' and 'stale-config' are repaired by autoFixAllProfiles (which
+  // runs first); nothing more to do here for them.
+  if (status === 'installed' || status === 'stale-path' || status === 'stale-config') return;
 
   const config = vscode.workspace.getConfiguration('claudeNotifications');
   const autoSetup = config.get('autoSetupHooks', true);
@@ -774,7 +1037,7 @@ async function runFirstRunChecks(context, log, statusBarItem) {
         return;
       }
     }
-    const result = installHooks(context.extensionPath, {});
+    const result = installHooks(wrapper, {});
     if (result.success) {
       log.appendLine('Hooks installed on first run');
       vscode.window.showInformationMessage(
@@ -791,7 +1054,7 @@ async function runFirstRunChecks(context, log, statusBarItem) {
   if (status === 'legacy') {
     if (autoSetup) {
       // Auto-upgrade silently with a confirmation toast.
-      const result = installHooks(context.extensionPath, { replaceLegacy: true });
+      const result = installHooks(wrapper, { replaceLegacy: true });
       if (result.success) {
         log.appendLine('Legacy shell-script hooks auto-upgraded to Node.js hooks');
         vscode.window.showInformationMessage(
@@ -847,6 +1110,11 @@ function syncSettingsToConfig(extensionPath, log) {
     waiting: cfg.get('waiting.action', 'Sound + Notification'),
     completed: cfg.get('completed.action', 'Sound + Notification')
   };
+
+  // Windows-only: read by bin/win-click-handler.js (the OS toast launcher) at
+  // click time to decide between Win32 HWND focusing ("hwnd", default) and
+  // the legacy `code <workspace>` CLI routing ("cli"). See README.
+  config.windowsClickBehavior = cfg.get('windows.clickBehavior', 'hwnd');
 
   writeConfig(config);
   log.appendLine('Settings synced to shared config');

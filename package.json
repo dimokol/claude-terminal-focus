@@ -2,7 +2,7 @@
   "name": "claude-notifications",
   "displayName": "Claude Notifications",
   "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.",
-  "version": "3.3.2",
+  "version": "3.5.5",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
@@ -88,6 +88,10 @@
       {
         "command": "claudeNotifications.setupMacNotifier",
         "title": "Claude Notifications: Configure macOS terminal-notifier"
+      },
+      {
+        "command": "claudeNotifications.uninstall",
+        "title": "Claude Notifications: Uninstall (remove hooks, registry, state)"
       }
     ],
     "configuration": {
@@ -199,20 +203,44 @@
           ],
           "enumItemLabels": [
             "Play sound",
-            "Stay silent"
+            "No sound"
           ],
           "enumDescriptions": [
-            "Play the configured audio cue even when you're already on the matching terminal.",
-            "No sound or toast when you're already on the matching terminal."
+            "Play the configured audio cue when you're already on the matching terminal.",
+            "Suppress the audio cue when you're already on the matching terminal."
           ],
           "default": "sound",
           "order": 90,
-          "description": "What to do when you're already on the terminal Claude just wrote to."
+          "description": "Audio behaviour when you're already on the terminal Claude just wrote to. (Visible toast is controlled separately by claudeNotifications.toastWhenFocused.)"
+        },
+        "claudeNotifications.toastWhenFocused": {
+          "type": "boolean",
+          "default": false,
+          "order": 91,
+          "description": "Show an in-window info toast when you're already on the matching terminal. Default off — the audio cue alone is usually enough since you're looking at the terminal. Enable for a visual cue alongside (or instead of) the sound, e.g. multi-monitor / small-terminal-panel setups, or accessibility."
         },
         "claudeNotifications.macOS.setup": {
           "type": "null",
           "order": 100,
           "markdownDescription": "macOS only. [Configure terminal-notifier](command:claudeNotifications.setupMacNotifier) for click-to-open banners."
+        },
+        "claudeNotifications.windows.clickBehavior": {
+          "type": "string",
+          "enum": [
+            "hwnd",
+            "cli"
+          ],
+          "enumItemLabels": [
+            "Exact window (recommended)",
+            "code CLI (legacy)"
+          ],
+          "enumDescriptions": [
+            "Identifies the specific VS Code instance that produced the notification via its process tree and focuses its window directly via Win32 SetForegroundWindow. Required when you have multiple VS Code windows open — the `code` CLI otherwise routes to whichever instance is most recently focused, not the one Claude is in.",
+            "Routes the click through the `code <workspace>` CLI. Always worked for single-instance setups; can land on the wrong window when multiple VS Code instances are open. Use this only if the default HWND path misbehaves on your machine."
+          ],
+          "default": "hwnd",
+          "order": 110,
+          "markdownDescription": "Windows only. How the OS-banner click resolves which VS Code window to focus. Falls back to the CLI path automatically if HWND focusing fails for any reason — this setting only forces the choice up front."
         }
       }
     }

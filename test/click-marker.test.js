@@ -81,3 +81,81 @@ test('buildClickMarkerPayload survives a JSON round-trip', () => {
   assert.strictEqual(reparsed.event, 'completed');
   assert.deepStrictEqual(reparsed.pids, [1, 2, 3]);
 });
+
+test('buildClickMarkerPayload includes aiTitle when provided', () => {
+  const payload = buildClickMarkerPayload({
+    sessionId: 'abc',
+    pids: [123],
+    event: 'completed',
+    project: 'demo',
+    aiTitle: 'Implement caching'
+  });
+  const parsed = JSON.parse(payload);
+  assert.strictEqual(parsed.aiTitle, 'Implement caching');
+});
+
+test('buildClickMarkerPayload sets aiTitle="" when omitted', () => {
+  const payload = buildClickMarkerPayload({
+    sessionId: 'abc',
+    pids: [123],
+    event: 'completed',
+    project: 'demo'
+  });
+  const parsed = JSON.parse(payload);
+  assert.strictEqual(parsed.aiTitle, '');
+});
+
+test('parseClickMarker returns aiTitle when present in JSON', () => {
+  const json = JSON.stringify({
+    sessionId: 's', event: 'waiting', project: 'demo',
+    pids: [1], aiTitle: 'Build feature X', timestamp: Date.now()
+  });
+  const parsed = parseClickMarker(json);
+  assert.strictEqual(parsed.aiTitle, 'Build feature X');
+});
+
+test('parseClickMarker returns aiTitle="" when missing or non-string', () => {
+  const a = parseClickMarker(JSON.stringify({
+    sessionId: 's', event: 'waiting', project: 'demo', pids: [1], timestamp: Date.now()
+  }));
+  assert.strictEqual(a.aiTitle, '');
+
+  const b = parseClickMarker(JSON.stringify({
+    sessionId: 's', event: 'waiting', project: 'demo', pids: [1], aiTitle: 99, timestamp: Date.now()
+  }));
+  assert.strictEqual(b.aiTitle, '');
+});
+
+test('buildClickMarkerPayload includes shellPid, workspaceRoot, projectDir when provided', () => {
+  const payload = buildClickMarkerPayload({
+    sessionId: 'abc', pids: [1, 2, 3], shellPid: 18832,
+    workspaceRoot: 'd:\\proj', projectDir: 'd:\\proj',
+    event: 'completed', project: 'proj'
+  });
+  const parsed = JSON.parse(payload);
+  assert.strictEqual(parsed.shellPid, 18832);
+  assert.strictEqual(parsed.workspaceRoot, 'd:\\proj');
+  assert.strictEqual(parsed.projectDir, 'd:\\proj');
+});
+
+test('parseClickMarker round-trips shellPid / workspaceRoot / projectDir', () => {
+  const payload = buildClickMarkerPayload({
+    sessionId: 'abc', pids: [1], shellPid: 18832,
+    workspaceRoot: '/home/u/proj', projectDir: '/home/u/proj',
+    event: 'waiting', project: 'proj'
+  });
+  const parsed = parseClickMarker(payload);
+  assert.strictEqual(parsed.shellPid, 18832);
+  assert.strictEqual(parsed.workspaceRoot, '/home/u/proj');
+  assert.strictEqual(parsed.projectDir, '/home/u/proj');
+});
+
+test('parseClickMarker defaults new fields when missing', () => {
+  const raw = JSON.stringify({
+    sessionId: 's', event: 'waiting', project: 'demo', pids: [1], timestamp: Date.now()
+  });
+  const parsed = parseClickMarker(raw);
+  assert.strictEqual(parsed.shellPid, 0);
+  assert.strictEqual(parsed.workspaceRoot, '');
+  assert.strictEqual(parsed.projectDir, '');
+});
