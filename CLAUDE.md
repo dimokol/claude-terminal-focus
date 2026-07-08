@@ -2,7 +2,7 @@
 
 > Project: **Claude Notifications** — VS Code extension (publisher `dimokol`, id `dimokol.claude-notifications`).
 > Repo name on disk: `claude-terminal-focus` (legacy directory name; do not rename, the publisher id is what users see).
-> Current version: **3.5.0**.
+> Current version: **3.6.0**.
 > User: solo maintainer, dev machine is macOS, target users are Claude Code users on macOS / Windows / Linux.
 
 This file is the entry point for any Claude / AI coding agent working in this repo. Read it before touching code or doing release work.
@@ -11,7 +11,7 @@ This file is the entry point for any Claude / AI coding agent working in this re
 
 ## What this extension does (in one paragraph)
 
-Claude Code (Anthropic's CLI) fires hooks on `Stop`, `Notification`, `PermissionRequest`, and `UserPromptSubmit`. This extension installs those hooks (`~/.claude/settings.json`) so they invoke its bundled `dist/hook.js` (and `dist/hook-user-prompt.js`). When Claude needs your attention, the hook either lets the running VS Code extension claim the event (in-window toast + sound + optional Focus-Terminal action) or fires an OS banner itself if VS Code isn't focused. The two sides race for an atomic claim marker so exactly one notification fires per stage. Stage-ID dedup (v3.2.0) suppresses re-fires of the same event until the user acknowledges (clicks the banner, uses Focus Terminal, or is already on the matching terminal) or sends a new prompt.
+Claude Code (Anthropic's CLI) fires hooks on `Stop`, `Notification`, `PermissionRequest`, `PreToolUse` (installed with an exact `AskUserQuestion` matcher — the redundant question channel), and `UserPromptSubmit`. This extension installs those hooks (`~/.claude/settings.json`) so they invoke its bundled `dist/hook.js` (and `dist/hook-user-prompt.js`). When Claude needs your attention, the hook either lets the running VS Code extension claim the event (in-window toast + sound + optional Focus-Terminal action) or fires an OS banner itself if VS Code isn't focused. The two sides race for an atomic claim marker so exactly one notification fires per stage. Stage-ID dedup (v3.2.0) suppresses re-fires of the same event until the user acknowledges (clicks the banner, uses Focus Terminal, or is already on the matching terminal) or sends a new prompt.
 
 Read **`README.md`** for the user-facing description; this file focuses on what an agent needs to keep the project healthy.
 
@@ -21,19 +21,22 @@ Read **`README.md`** for the user-facing description; this file focuses on what 
 
 ```
 ~/.claude/settings.json (Claude Code's hook config — written by the installer)
-   └─ on Stop / Notification / PermissionRequest → node dist/hook.js
-   └─ on UserPromptSubmit                       → node dist/hook-user-prompt.js
+   └─ on Stop / Notification / PermissionRequest → node hook wrapper → dist/hook.js
+   └─ on PreToolUse (matcher: AskUserQuestion)   → node hook wrapper → dist/hook.js
+   └─ on UserPromptSubmit                        → node hook wrapper → dist/hook-user-prompt.js
 
 repo root
 ├── extension.js              # VS Code extension entry. Polls signal files at 400 ms.
-├── hook.js                   # Out-of-process Claude Code hook (Stop/Notification/PermissionRequest).
+├── hook.js                   # Out-of-process Claude Code hook (Stop/Notification/PermissionRequest/PreToolUse[AskUserQuestion]).
 ├── hook-user-prompt.js       # Out-of-process Claude Code hook (UserPromptSubmit). Tiny — only advances stageId.
 ├── esbuild.js                # Bundles all three entry points into dist/.
 ├── package.json              # version, scripts, contributes (commands/settings), extensionDependencies.
 │
 ├── lib/
-│   ├── signals.js            # Signal-file parsing + atomic claim marker (`O_EXCL`).
-│   ├── state-paths.js        # ~/.claude/focus-state/<sha1(workspace).slice(0,12)>/ path derivation.
+│   ├── signals.js            # Signal-file parsing + atomic claim marker (`O_EXCL`, sessionId:stageId tags).
+│   ├── state-paths.js        # ~/.claude/focus-state/<sha1(workspace).slice(0,12)>/ path derivation (lazy root for test sandboxing).
+│   ├── hook-input.js         # Pure hook-stdin classification: notification_type semantics + AskUserQuestion question extraction.
+│   ├── terminal-names.js     # User-renamed-tab detection + pid→name cache (extension writes, hook.js reads for banner labels).
 │   ├── stage-dedup.js        # Stage-ID state machine (shouldNotify, advanceOnPrompt, markResolved).
 │   ├── click-marker.js       # Parse/build the JSON payload terminal-notifier writes on click.
 │   ├── process-tree.js       # Cross-platform process snapshot + walkUp/walkDown. Replaces per-PID wmic/ps.
@@ -61,13 +64,16 @@ repo root
 
 ```
 ~/.claude/focus-state/<sha1(workspaceRoot).slice(0,12)>/
-  signal       # JSON v2 signal file (event, sessionId, pids, project, state) — shared per workspace
-  clicked      # JSON click marker written by terminal-notifier -execute. Carries the originating
-               #   session's pids/sessionId/event/project so click-to-focus targets the right
-               #   terminal even if a sibling session has since overwritten `signal`. Empty
-               #   pre-v3.3.1 markers fall back to the signal file.
-  claimed      # atomic claim marker (O_EXCL, 5 s lifespan)
-  sessions     # JSON map: { sessionId: { stageId, lastEvent, resolved, lastNotifiedAt, updatedAt } }
+  signal          # JSON v2 signal file (event, sessionId, stageId, pids, question, customName, state) — shared per workspace
+  clicked         # JSON click marker written by terminal-notifier -execute. Carries the originating
+                  #   session's pids/sessionId/event/project so click-to-focus targets the right
+                  #   terminal even if a sibling session has since overwritten `signal`. Empty
+                  #   pre-v3.3.1 markers fall back to the signal file.
+  claimed         # atomic claim marker (O_EXCL, content `<ts>:<sessionId>:<stageId>`; same-tag stale 5s, cross-tag steal 2s)
+  sessions        # JSON map: { sessionId: { stageId, lastEvent, lastHookEventName, resolved, lastNotifiedAt, updatedAt } }
+  terminal-names  # JSON { updatedAt, names: { pid: terminalName } } — written by the extension's poll
+                  #   (on change + 60s heartbeat); hook.js reads it to put user-renamed tab names on
+                  #   OS banners. Stale after 5 min (VS Code closed → expires).
 ```
 
 This location is **outside** any workspace's `.vscode/` directory and therefore can never appear in `git status`. Do not move it back inside the workspace.
@@ -96,9 +102,9 @@ markResolved(workspaceRoot, sessionId):     # called by extension on EXPLICIT us
 
 **Primary vs trailer (the rule that guarantees exactly one notification per attention point).** Empirically (instrumented 2026-05-29), every attention point is announced by a PRIMARY event — `Stop` (completion) or `PermissionRequest`/`PreToolUse` (a new question / tool request; **every `AskUserQuestion` fires its own `PermissionRequest`**). A bare `Notification` is ALWAYS a trailer or a "still waiting" re-fire of the primary that already notified ("Claude is waiting for your input" / "Claude needs your permission"). So a `Notification` never escapes the burst window — it is always suppressed — while a primary arriving after the window is a genuinely new point and notifies. This guarantees **at least one** notification per question/completion and **at most one** (trailers and late re-fires collapse).
 
-This also sidesteps the upstream `AskUserQuestion` limitation: Claude Code's `AskUserQuestion` does NOT fire `PreToolUse`/`PostToolUse` ([anthropics/claude-code#15872](https://github.com/anthropics/claude-code/issues/15872)), AND **answering a question does not emit `UserPromptSubmit`** (confirmed empirically), so there is no ack hook to advance the stage between back-to-back questions. We don't need one: each question's own `PermissionRequest` is the new-attention-point signal, so it notifies via the primary-escape branch. `STAGE_ESCAPE_VALVE_MS = 3000` is just the burst window (collapses the ~100ms–2s platform pair and the lock-ordering race); it no longer decides "new vs re-fire" by time.
+**Question redundancy (3.6.0).** The old premise "#15872: AskUserQuestion fires no PreToolUse" is dead — the issue was closed not_planned (2026-03-15) and `PreToolUse` officially fires for `AskUserQuestion` (documented; since claude-code v2.1.85). Meanwhile AskUserQuestion is documented as NOT permission-gated, so its `PermissionRequest` firing is an implementation artifact upstream could drop any release. We therefore install BOTH: `PermissionRequest` (matcher `''`) and `PreToolUse` (matcher exactly `AskUserQuestion` — never a bare matcher, that would fire for every tool call). When both fire for one question (~simultaneously), the burst window collapses them to one notification; if either disappears upstream, the other still announces the question. **Answering a question does not emit `UserPromptSubmit`** (still true), so back-to-back questions notify via the primary-escape branch. `STAGE_ESCAPE_VALVE_MS = 3000` is just the burst window (collapses the platform pair and the lock-ordering race); it doesn't decide "new vs re-fire" by time.
 
-**If #15872 ships** (PostToolUse fires for AskUserQuestion): nothing is forced to change — the primary/trailer rule already works. Optionally, a `PostToolUse` hook calling `advanceOnPrompt` would let the burst window shrink, but it is no longer required.
+**notification_type semantics (3.6.0, `lib/hook-input.js`).** `Notification` hook input carries `notification_type`. Status-only types (`auth_success`, `elicitation_complete`, `elicitation_response`) are skipped before dedup. `agent_needs_input` / `agent_completed` (background agents, claude-code ≥2.1.198) and `elicitation_dialog` have NO primary of their own, so they're reclassified as synthetic primaries (dedup name ≠ 'Notification') — otherwise the trailer rule would suppress them forever. `permission_prompt` / `idle_prompt` / unknown stay trailers. Note: Claude Code only fires a dialog's Notification after ~6s of user inactivity, so it was never a reliable channel anyway.
 
 **Important — what counts as an "ack" for `markResolved`:** Focus-Terminal toast click,
 OS-banner click. The "Already on correct terminal" sound-only path **does not** call
@@ -133,6 +139,8 @@ For every stage, **exactly one** of these fires (never zero, never two):
 
 The race is resolved by `claimHandled()` in `lib/signals.js` using `fs.writeFileSync(claimPath, ..., {flag: 'wx'})` (POSIX `O_EXCL`). Whoever creates the marker first wins; the loser exits silently.
 
+**Claim tags (3.6.0).** The marker content is `<ts>:<sessionId>:<stageId>`. A claimant whose tag MATCHES the marker (same attention point — the extension racing the approved hook, or a crash leftover) defers until `CLAIM_STALE_MS` (5s). A claimant with a DIFFERENT tag is a new, already-dedup-approved attention point and may steal after `CLAIM_CROSS_STAGE_STEAL_MS` (2s). Without the tags, any event approved 3–5s after the previous notification (dedup escape at 3s < claim staleness at 5s) was silently swallowed — zero notifications, the invariant's "never zero" half broken. Untagged (legacy/no-session) claims keep the conservative 5s rule.
+
 ---
 
 ## Development workflow
@@ -151,7 +159,7 @@ npm run build         # node esbuild.js — produces dist/extension.js, dist/hoo
 npm test              # node --test test/*.test.js
 ```
 
-Currently 32 tests across `state-paths`, `stage-dedup`, `hooks-installer`, and `click-marker`. There is **no UI test harness** for the extension itself — `extension.js` is verified manually via the steps in the relevant plan's "End-to-end manual verification" task. If you add new pure logic, write `node:test` tests for it.
+Currently ~230 tests across 17 files (state-paths, stage-dedup + concurrency, signals/claims, hooks-installer, hook-wrapper, hook-runtime, hook-input, click-marker, terminal-match, process-tree, code-build, code-instance-resolver, transcript-title, win-protocol, win-click-handler). The suite sandboxes `HOME` into a temp dir via `test/helpers.js` — any new test that touches state paths must `require('./helpers')`. There is **no UI test harness** for the extension itself — `extension.js` is verified manually via the steps in the relevant plan's "End-to-end manual verification" task. If you add new pure logic, write `node:test` tests for it.
 
 ### Manual smoke-test the hook outside VS Code
 
@@ -223,8 +231,10 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 
 ## Known limitations and tech debt
 
-- **Sessions file is read-modify-write, not atomic.** Two simultaneous hook invocations for the same workspace can clobber each other's writes. In practice the atomic claim marker serializes the meaningful work; a clobber here only loses an `updatedAt` timestamp. If this turns into a real bug, switch to `fs.writeFileSync` with a temp file + `fs.renameSync` (atomic on POSIX/Windows) and a small retry loop.
 - **Silent write failures.** `lib/stage-dedup.js#writeSessions` swallows errors. If `~/.claude/focus-state/` becomes unwritable, dedup silently degrades to "always notify". An optional `console.error` to stderr from hook.js (where it lands in Claude's hook log) would surface this. Not critical.
+- **`node` must be on Claude Code's PATH for hooks to run.** Hook commands are `node "<wrapper>"`; a machine where `claude` is a native binary and Node.js isn't installed (or isn't on the PATH Claude inherits) gets zero notifications with no in-product error. Claude Code's hook log shows the spawn failure. No fix planned — pinning an absolute node path breaks on version-manager updates.
+- **Linux has no click-to-focus.** `notify-send` banners carry no action; clicking does nothing. Sound + banner only.
+- **Remote/WSL/SSH is untested.** The extension likely runs on the remote host (no `extensionKind` declared); in-window toasts should work, OS banners/sounds run on the remote side and may be silent on headless hosts. WSLg setups reportedly show notify-send banners.
 - **No automated UI tests.** `extension.js` is exercised manually. The `vscode-test` harness is heavy and the manual checklist has been good enough so far.
 - **Workspace root heuristic.** `hook.js` walks up looking for a `.vscode/` directory. If the user runs Claude from a deeply nested subdirectory of a non-VS-Code repo, they get an isolated state dir per `claude` invocation. Acceptable.
 - **`extensionPack` is softer than `extensionDependencies` was, but still tied to the upstream ID.** If `anthropic.claude-code` is renamed or unpublished, the install-time bundle breaks (our extension still installs fine). See the publish checklist.
@@ -236,7 +246,8 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 | Symptom | First place to check |
 |---|---|
 | Duplicate banners | `~/.claude/focus-state/<hash>/sessions` — is `resolved` getting set on ack? Read `extension.js` ack paths. Re-check `stage-dedup.js#shouldNotify`. |
-| No banners at all | `~/.claude/settings.json` hook entries (`hooks.Stop[*].hooks[*].command` should point at `dist/hook.js`). Then check `hook.js` for early-exits (muted, event disabled, dedup suppressed). |
+| No banners at all | `~/.claude/settings.json` hook entries (should point at the `~/.claude/claude-notifications/` wrapper). Then check `hook.js` for early-exits (muted, event disabled, dedup suppressed, skip-type notification). Confirm `node` is on Claude's PATH. |
+| Questions (AskUserQuestion) don't notify | Both channels should announce them: `PermissionRequest` (matcher `''`) AND `PreToolUse` (matcher `AskUserQuestion`) entries must exist in settings.json. Check the sessions file `lastHookEventName`. Also check the user's claude version: 2.1.198–2.1.199 auto-answered questions after 60s idle (looks like a missed notification; upstream, fixed by updating). |
 | Wrong terminal focused | "Claude Notifications" Output channel. Look for `pids=[...]` and `Active terminal after switch`. The PID match logic is in `extension.js#focusMatchingTerminal`. |
 | Windows OS-banner click does nothing / opens unexpected window | `reg query "HKCU\Software\Classes\claude-notif\shell\open\command"` — does it exist and point at `%LOCALAPPDATA%\claude-notifications\win-click-handler.js`? Then check the "Claude Notifications" Output channel for `Windows click-handler registered:` at activation. If registration failed (e.g. node not on PATH at activation time), the OS-banner click reverts to no-op. The launcher is rewritten + the registry re-registered on every activation, so a VS Code reload usually self-heals. |
 | Wrong terminal after OS-banner click | Look for `Click-to-focus [marker]` vs `[signal-fallback]` in the log. `[marker]` should be the common path. `[signal-fallback]` means the click marker was empty/stale/corrupt — the per-workspace signal file is shared and may point at a sibling session. The marker payload itself is built in `hook.js` (terminal-notifier `-execute`) and parsed by `lib/click-marker.js`. |
@@ -250,10 +261,10 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 
 ## Project context (for the agent)
 
-- **User's role:** solo developer; this is a personal/portfolio extension. Not yet published to the VS Code Marketplace at the time of this writing — currently distributed by VSIX install.
+- **User's role:** solo developer; this is a personal/portfolio extension. **Published on the VS Code Marketplace** (v3.5.5 live as of 2026-07-07: ~1,400 installs, 5.0 rating).
 - **Quality bar:** ship-quality but not enterprise. The user prefers concise, decisive recommendations to long deliberation. Confirm before destructive ops; otherwise proceed.
 - **Testing reality:** primary dev machine is macOS. Windows testing happens later, on a separate machine. Keep platform-specific code in clearly labeled branches.
-- **No production users yet** as of v3.3.1 — clean cutovers are preferred over migration shims.
+- **There ARE production users now** — every schema/behavior change needs an auto-migration path (the `stale-config` / `partial` detection in `hooks-installer.js` is the mechanism; new hook entries or entry-shape changes must be flagged there so existing installs upgrade on activation).
 
 ---
 

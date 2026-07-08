@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // hook.js — Claude Code hook script (runs OUTSIDE VS Code)
-// Called by Claude Code on Stop, Notification, and PermissionRequest events.
+// Called by Claude Code on Stop, Notification, PermissionRequest, and
+// PreToolUse (matcher-scoped to AskUserQuestion) events.
 //
 // Flow:
-// 1. Write JSON signal file (.vscode/.claude-focus) with state=pending
+// 1. Write JSON signal file (~/.claude/focus-state/<hash>/signal) with state=pending
 // 2. Sleep HANDSHAKE_MS (1200ms) — give the extension time to claim
 // 3. Atomically try to claim the handled-marker:
 //    - If the extension already claimed it: exit silently (ext handled).
@@ -33,17 +34,20 @@ const { buildClickMarkerPayload } = require('./lib/click-marker');
 const { readAiTitle } = require('./lib/transcript-title');
 const { snapshot: processSnapshot, walkUp } = require('./lib/process-tree');
 const { schemeForBinaryName, classifyBuild } = require('./lib/code-build');
+const { classifyHookInput, extractQuestionText } = require('./lib/hook-input');
+const { readTerminalNamesCache, lookupCustomName } = require('./lib/terminal-names');
 
 // Process names we consider "the interactive shell hosting Claude". The
 // first ancestor matching one of these is recorded as signal.shellPid —
 // the extension prefers it over the raw pid list when matching terminals.
 const SHELL_PROCESS_NAMES = new Set([
   'bash.exe', 'sh.exe', 'zsh.exe', 'pwsh.exe', 'powershell.exe',
-  'cmd.exe', 'fish.exe', 'wsl.exe',
+  'cmd.exe', 'fish.exe', 'wsl.exe', 'nu.exe',
   // POSIX (no .exe), as reported by `ps -o comm=`. Includes the
   // login-shell '-' prefix variants.
   'bash', '-bash', 'sh', '-sh', 'zsh', '-zsh', 'pwsh', 'powershell',
-  'fish', '-fish'
+  'fish', '-fish', 'dash', '-dash', 'ksh', '-ksh', 'tcsh', '-tcsh',
+  'csh', '-csh', 'nu'
 ]);
 
 const CONFIG_FILE = 'claude-notifications-config.json';
@@ -52,6 +56,46 @@ const DEFAULT_HANDSHAKE_MS = 1200;
 // Shell-escape a single argument (POSIX single-quote style).
 function shEsc(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+// Atomic write: temp + rename, so the extension's 400ms poller can never
+// read a torn half-written signal (renameSync is atomic on POSIX and on
+// NTFS). A torn read used to fall through parseSignal's lenient v1 branch
+// and fire a bogus "waiting" notification with default text.
+function writeFileAtomic(p, data) {
+  const tmp = `${p}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+    throw err;
+  }
+}
+
+// Absolute-path probe for Homebrew/MacPorts binaries. Claude Code's hook
+// environment inherits the PATH of whatever launched the `claude` session;
+// when VS Code was started from the Dock/Finder that PATH often lacks
+// /opt/homebrew/bin, so a bare `command -v terminal-notifier` misses an
+// installed binary and banners silently degrade to the osascript fallback
+// (no click-to-focus). Mirrors extension.js#findMacBinary.
+const MAC_BIN_DIRS = ['/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin'];
+function findMacBinary(name) {
+  for (const dir of MAC_BIN_DIRS) {
+    const p = `${dir}/${name}`;
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return p;
+    } catch (_) {}
+  }
+  try {
+    const stdout = execSync(`command -v ${name}`, {
+      encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore']
+    }).trim();
+    return stdout || null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // Build the spawn argv for a hidden PowerShell that escapes Claude Code's
@@ -93,19 +137,32 @@ function xmlEsc(s) {
 
   let hookEvent = 'waiting';
   let hookEventName = '';
+  let dedupEventName = '';
   let hookMessage = '';
   let sessionId = '';
   let transcriptPath = '';
+  let question = '';
   try {
     const stdinData = fs.readFileSync(0, 'utf8');
     const input = JSON.parse(stdinData);
-    hookEventName = input.hook_event_name || '';
     hookMessage = typeof input.message === 'string' ? input.message : '';
     sessionId = input.session_id || '';
     transcriptPath = typeof input.transcript_path === 'string' ? input.transcript_path : '';
-    const eventName = hookEventName.toLowerCase();
-    if (eventName === 'stop') hookEvent = 'completed';
-    else hookEvent = 'waiting'; // notification, permissionrequest, etc.
+
+    // Map raw event + notification_type into the two-type model. Pure
+    // status notifications (auth_success, elicitation_complete/response)
+    // exit here, BEFORE dedup, so they never pollute the stage state.
+    const cls = classifyHookInput(input);
+    if (cls.skip) process.exit(0);
+    hookEvent = cls.event;
+    hookEventName = cls.hookEventName;
+    dedupEventName = cls.dedupEventName;
+
+    // AskUserQuestion (via PermissionRequest or PreToolUse) carries the
+    // question in tool_input — surface it in the banner/toast text.
+    const toolName = typeof input.tool_name === 'string' ? input.tool_name : '';
+    const toolInput = (input.tool_input && typeof input.tool_input === 'object') ? input.tool_input : null;
+    question = extractQuestionText(toolName, toolInput);
   } catch (_) {}
 
   // aiTitle: best-effort. Missing transcript / no ai-title record / parse
@@ -163,10 +220,16 @@ function xmlEsc(s) {
   // unresolved stage. Stage advances on event-type change, on previous
   // stage being resolved (user ack), or on UserPromptSubmit (handled by
   // hook-user-prompt.js). See lib/stage-dedup.js for the full state machine.
-  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent, hookEventName);
+  // The machine reasons about dedupEventName (which reclassifies e.g.
+  // Notification(agent_needs_input) as a primary), not the raw name.
+  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent, dedupEventName || hookEventName);
   if (!dedup.notify) {
     process.exit(0);
   }
+  // Tags the claim marker with this attention point's identity so a claim
+  // left by the PREVIOUS stage can't swallow this notification (see
+  // lib/signals.js#CLAIM_CROSS_STAGE_STEAL_MS).
+  const claimTag = (sessionId && dedup.stageId) ? `${sessionId}:${dedup.stageId}` : '';
 
   // --- 4. Build PID ancestor chain ---
   //
@@ -214,6 +277,17 @@ function xmlEsc(s) {
     );
   } catch (_) {}
 
+  // User-custom terminal name (VS Code tab rename), from the cache the
+  // extension maintains. Preferred over aiTitle in banner text — "deploy-bot"
+  // is the user's own label for the session. '' when the cache is missing/
+  // stale, the pid isn't a VS Code terminal (external shells, Git Bash's
+  // masked chain), or the name isn't user-custom.
+  const customName = lookupCustomName(
+    readTerminalNamesCache(workspaceRoot),
+    { shellPid, pids },
+    { aiTitle, project: projectName }
+  );
+
   // --- 5. Write signal file ---
   // If another hook (for a concurrent event) already wrote a signal with a
   // higher-priority event, preserve it. This makes "waiting" (user action
@@ -236,7 +310,10 @@ function xmlEsc(s) {
       event: hookEvent,
       hookEventName,
       hookMessage,
+      question: question || undefined,
+      customName: customName || undefined,
       sessionId,
+      stageId: dedup.stageId || undefined,
       project: projectName,
       projectDir: projectDir,
       workspaceRoot: workspaceRoot,
@@ -248,7 +325,7 @@ function xmlEsc(s) {
       aiTitle,
       timestamp: Date.now()
     };
-    fs.writeFileSync(signalPath, JSON.stringify(signalPayload, null, 2));
+    try { writeFileAtomic(signalPath, JSON.stringify(signalPayload, null, 2)); } catch (_) {}
   }
 
   // If muted, the signal file is written (useful for Focus Terminal if
@@ -267,7 +344,16 @@ function xmlEsc(s) {
     completed: { title: 'Claude Code — Done', message: `Task completed in: ${projectName}`, sound: 'task-complete' },
     waiting: { title: 'Claude Code', message: `Waiting for your response in: ${projectName}`, sound: 'notification' }
   };
-  const eventInfo = eventMessages[hookEvent] || eventMessages.waiting;
+  const eventInfo = { ...(eventMessages[hookEvent] || eventMessages.waiting) };
+  // Show the actual question when we have it — "Question in api-server:
+  // Which auth method should we use?" beats a generic waiting line.
+  if (hookEvent === 'waiting' && question) {
+    eventInfo.message = `Question in ${projectName}: ${question}`;
+  }
+  // The banner's identity line (macOS subtitle / Windows second text row):
+  // the user's own terminal name when they renamed the tab, else the
+  // AI-generated session title.
+  const bannerLabel = customName || aiTitle;
 
   // --- 7. Handshake: wait for extension to claim ---
 
@@ -288,8 +374,10 @@ function xmlEsc(s) {
 
   // Atomically claim the right to fire. Either the extension already
   // claimed it (during the handshake) or a sibling hook.js did — in either
-  // case we exit silently so the user sees exactly one notification.
-  if (!claimHandled(claimPath)) {
+  // case we exit silently so the user sees exactly one notification. The
+  // tag lets us steal a claim left by a PREVIOUS attention point (cross-
+  // stage) without weakening same-point dedup.
+  if (!claimHandled(claimPath, { tag: claimTag })) {
     process.exit(0);
   }
 
@@ -300,7 +388,7 @@ function xmlEsc(s) {
   try {
     const onDisk = JSON.parse(fs.readFileSync(signalPath, 'utf8'));
     onDisk.state = 'fired';
-    fs.writeFileSync(signalPath, JSON.stringify(onDisk, null, 2));
+    writeFileAtomic(signalPath, JSON.stringify(onDisk, null, 2));
   } catch (_) {}
 
   // --- 8. Fallback: fire OS banner + sound ---
@@ -393,8 +481,12 @@ function xmlEsc(s) {
 
   if (process.platform === 'darwin') {
     const codeCli = findCodeCli();
-    try {
-      execSync('command -v terminal-notifier', { stdio: 'ignore' });
+    // Probe absolute Homebrew/MacPorts paths first — the hook's PATH often
+    // lacks them (VS Code launched from the Dock), and missing the binary
+    // here silently downgraded banners to the click-less osascript path.
+    const tnBinary = findMacBinary('terminal-notifier');
+    if (tnBinary) {
+      try {
       // On click: write a JSON click-marker carrying THIS session's
       // pids/sessionId/event so the extension focuses the right terminal
       // even if a sibling session's hook has since overwritten the shared
@@ -412,19 +504,24 @@ function xmlEsc(s) {
         '-execute', executeCmd,
         '-group', `claude-${projectName}`,
       ];
-      if (aiTitle) {
-        notifierArgs.splice(2, 0, '-subtitle', aiTitle);
+      if (bannerLabel) {
+        notifierArgs.splice(2, 0, '-subtitle', bannerLabel);
       }
-      const child = spawn('terminal-notifier', notifierArgs, { detached: true, stdio: 'ignore' });
+      const child = spawn(tnBinary, notifierArgs, { detached: true, stdio: 'ignore' });
       child.unref();
-    } catch (_) {
+      } catch (_) {}
+    } else {
       try {
-        const osaTitle = aiTitle
-          ? `${eventInfo.title} — ${aiTitle.replace(/"/g, '\\"')}`
-          : eventInfo.title;
-        execSync(`osascript -e 'display notification "${eventInfo.message}" with title "${osaTitle}"'`, {
-          timeout: 3000, stdio: 'ignore'
-        });
+        // spawn with an args array (no shell) so apostrophes in titles or
+        // question text can't break out of quoting — the old single-quoted
+        // execSync string shattered on any aiTitle containing a '. Only
+        // AppleScript's own string escapes are needed. Detached spawn also
+        // keeps the hook from blocking on osascript (was a 3s execSync).
+        const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        const osaTitle = bannerLabel ? `${eventInfo.title} — ${bannerLabel}` : eventInfo.title;
+        const script = `display notification "${esc(eventInfo.message)}" with title "${esc(osaTitle)}"`;
+        const child = spawn('osascript', ['-e', script], { detached: true, stdio: 'ignore' });
+        child.unref();
       } catch (_) {}
     }
   } else if (process.platform === 'win32') {
@@ -498,7 +595,7 @@ function xmlEsc(s) {
     // goes through VS Code's published-extension URI handler instead, which
     // is reliable.
     const tmpScript = path.join(os.tmpdir(), `claude-notif-${Date.now()}-${process.pid}.ps1`);
-    const titleLine = aiTitle ? `    <text>${xmlEsc(aiTitle)}</text>` : '';
+    const titleLine = bannerLabel ? `    <text>${xmlEsc(bannerLabel)}</text>` : '';
     const clickMarkerJson = buildClickMarkerPayload({
       sessionId, pids, shellPid, workspaceRoot, projectDir,
       event: hookEvent, project: projectName, aiTitle

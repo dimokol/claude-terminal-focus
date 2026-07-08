@@ -2,7 +2,7 @@
   "name": "claude-notifications",
   "displayName": "Claude Notifications",
   "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.",
-  "version": "3.5.5",
+  "version": "3.6.0",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
@@ -240,7 +240,8 @@
           ],
           "default": "hwnd",
           "order": 110,
-          "markdownDescription": "Windows only. How the OS-banner click resolves which VS Code window to focus. Falls back to the CLI path automatically if HWND focusing fails for any reason — this setting only forces the choice up front."
+          "deprecationMessage": "Since v3.5.5 Windows toast clicks route through VS Code's own URI handler, which doesn't use this setting. It only applies to the legacy claude-notif:// launcher path.",
+          "markdownDescription": "Windows only, legacy. How a `claude-notif://` launcher click resolves which VS Code window to focus. Since v3.5.5 the toast click routes through VS Code's URI handler instead, so this setting normally has no effect."
         }
       }
     }

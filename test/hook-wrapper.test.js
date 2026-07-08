@@ -8,6 +8,8 @@ const {
   stripFromSettings,
   selfDestruct,
   pathExistsSync,
+  compareVersions,
+  findNewestExtensionHook,
   SELF_IDENTIFIERS
 } = require('../bin/hook-wrapper.cjs');
 
@@ -168,4 +170,75 @@ test('selfDestruct is idempotent — second call on already-clean state does not
   selfDestruct({ home, wrapperDir });
   // No throw is the assertion.
   assert.ok(true);
+});
+
+// --- update-window re-point (v3.6.0) ---
+//
+// When VS Code replaces the extension's version dir during an update, the
+// wrapper's recorded hook path goes missing BEFORE the new extension
+// activates and rewrites state.json. A Claude hook firing in that window
+// used to trigger a FULL self-destruct — hooks stripped from every profile
+// mid-session. The wrapper must instead re-point at the newest installed
+// version and only self-destruct when NO version remains (true uninstall).
+
+function mkExtRoot() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'cn-extroot-'));
+}
+
+function mkExtVersion(extRoot, version, { withHook = true, withUserPrompt = true } = {}) {
+  const dist = path.join(extRoot, `dimokol.claude-notifications-${version}`, 'dist');
+  fs.mkdirSync(dist, { recursive: true });
+  if (withHook) fs.writeFileSync(path.join(dist, 'hook.js'), '// hook');
+  if (withUserPrompt) fs.writeFileSync(path.join(dist, 'hook-user-prompt.js'), '// up');
+  return path.join(dist, 'hook.js');
+}
+
+test('compareVersions orders dotted versions numerically', () => {
+  assert.ok(compareVersions('3.10.0', '3.9.9') > 0, '3.10.0 > 3.9.9');
+  assert.ok(compareVersions('3.5.5', '3.6.0') < 0);
+  assert.equal(compareVersions('3.6.0', '3.6.0'), 0);
+  assert.ok(compareVersions('3.6', '3.6.0') === 0, 'missing segment = 0');
+});
+
+test('findNewestExtensionHook picks the highest installed version', () => {
+  const extRoot = mkExtRoot();
+  mkExtVersion(extRoot, '3.5.5');
+  const newestHook = mkExtVersion(extRoot, '3.6.0');
+  mkExtVersion(extRoot, '3.5.4');
+  // Recorded path points at a REMOVED version dir.
+  const recorded = path.join(extRoot, 'dimokol.claude-notifications-3.5.3', 'dist', 'hook.js');
+
+  const found = findNewestExtensionHook(recorded, false);
+  assert.ok(found, 'must find an installed version');
+  assert.equal(found.hookPath, newestHook);
+  assert.equal(found.version, '3.6.0');
+});
+
+test('findNewestExtensionHook resolves the user-prompt bundle when asked', () => {
+  const extRoot = mkExtRoot();
+  mkExtVersion(extRoot, '3.6.0');
+  const recorded = path.join(extRoot, 'dimokol.claude-notifications-3.5.5', 'dist', 'hook.js');
+  const found = findNewestExtensionHook(recorded, true);
+  assert.ok(found.hookPath.endsWith(path.join('dist', 'hook-user-prompt.js')));
+});
+
+test('findNewestExtensionHook skips version dirs whose dist bundle is missing', () => {
+  const extRoot = mkExtRoot();
+  mkExtVersion(extRoot, '3.7.0', { withHook: false, withUserPrompt: false }); // broken/partial install
+  const goodHook = mkExtVersion(extRoot, '3.6.0');
+  const recorded = path.join(extRoot, 'dimokol.claude-notifications-3.5.5', 'dist', 'hook.js');
+  const found = findNewestExtensionHook(recorded, false);
+  assert.equal(found.hookPath, goodHook, 'must fall back to the newest COMPLETE install');
+});
+
+test('findNewestExtensionHook returns null when no version is installed (true uninstall)', () => {
+  const extRoot = mkExtRoot();
+  const recorded = path.join(extRoot, 'dimokol.claude-notifications-3.5.5', 'dist', 'hook.js');
+  assert.equal(findNewestExtensionHook(recorded, false), null);
+});
+
+test('findNewestExtensionHook tolerates bogus recorded paths', () => {
+  assert.equal(findNewestExtensionHook('', false), null);
+  assert.equal(findNewestExtensionHook(null, false), null);
+  assert.equal(findNewestExtensionHook('/nonexistent/x/y/z/hook.js', false), null);
 });

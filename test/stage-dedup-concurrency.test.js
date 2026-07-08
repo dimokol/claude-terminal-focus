@@ -12,13 +12,20 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { fork } = require('child_process');
+// Sandboxes HOME so the forked workers' dedup state lands in a temp dir,
+// not the real ~/.claude/focus-state/ (workers inherit the env).
+require('./helpers');
 
 const WORKER_SCRIPT = path.join(__dirname, 'fixtures', 'shouldnotify-worker.js');
 
 function ensureWorker() {
+  // Relative require (resolved against the worker file's own location) so
+  // the generated fixture is byte-identical on every machine — an absolute
+  // path here left the committed fixture dirty after each test run on a
+  // different machine/OS.
   fs.mkdirSync(path.dirname(WORKER_SCRIPT), { recursive: true });
   fs.writeFileSync(WORKER_SCRIPT, `
-const { shouldNotify, advanceOnPrompt } = require('${path.join(__dirname, '..', 'lib', 'stage-dedup').replace(/\\/g, '/')}');
+const { shouldNotify, advanceOnPrompt } = require('../../lib/stage-dedup');
 const [workspaceRoot, sessionId, event, mode] = process.argv.slice(2);
 if (mode === 'prompt') {
   advanceOnPrompt(workspaceRoot, sessionId);

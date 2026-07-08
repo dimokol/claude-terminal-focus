@@ -27,6 +27,7 @@ const {
 const { markResolved } = require('./lib/stage-dedup');
 const { parseClickMarker } = require('./lib/click-marker');
 const { matchTerminal } = require('./lib/terminal-match');
+const { isCustomTerminalName, writeTerminalNamesCache, NAME_CACHE_HEARTBEAT_MS } = require('./lib/terminal-names');
 const { checkHookStatus, checkAllProfiles, installHooks, uninstallHooks, discoverProfiles } = require('./lib/hooks-installer');
 const { installHookRuntime, uninstallHookRuntime, getWrapperHookPath, getWrapperUserPromptPath } = require('./lib/hook-runtime');
 
@@ -147,6 +148,11 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
   const timer = setInterval(() => {
     if (!vscode.workspace.workspaceFolders) return;
 
+    // Keep the per-workspace pid→terminal-name cache fresh so hook.js can
+    // put user-custom tab names on OS banners. Fire-and-forget; writes
+    // only on change or heartbeat.
+    refreshTerminalNamesCache();
+
     for (const folder of vscode.workspace.workspaceFolders) {
       const workspaceRoot = folder.uri.fsPath;
 
@@ -206,8 +212,85 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
   // --- macOS terminal-notifier setup prompt (one-time) ---
   promptMacNotifierSetup(context, log);
 
+  // --- Best-effort GC of abandoned per-workspace state dirs ---
+  // One dir per workspace ever used accumulates forever otherwise (the
+  // dedup `sessions` maps prune entries at 1h, but the dirs remain).
+  // Deferred so it never competes with activation-critical work.
+  setTimeout(() => sweepOldStateDirs(log), 15000);
+
   log.appendLine(`Polling every ${POLL_MS}ms for signals`);
   log.appendLine('Ready');
+}
+
+// Delete focus-state workspace dirs untouched for 30+ days. Everything in
+// them is ephemeral coordination state (signal/claim markers live seconds,
+// session entries an hour), so removing an idle dir can never lose data —
+// the next hook fire simply recreates it.
+const STATE_DIR_GC_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+function sweepOldStateDirs(log) {
+  try {
+    const root = path.join(os.homedir(), '.claude', 'focus-state');
+    const entries = fs.readdirSync(root, { withFileTypes: true });
+    const now = Date.now();
+    let removed = 0;
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const dir = path.join(root, entry.name);
+      try {
+        const stat = fs.statSync(dir);
+        if (now - stat.mtimeMs > STATE_DIR_GC_AGE_MS) {
+          fs.rmSync(dir, { recursive: true, force: true });
+          removed++;
+        }
+      } catch (_) {}
+    }
+    if (removed > 0) log.appendLine(`Swept ${removed} stale focus-state dir(s) (untouched >30 days)`);
+  } catch (_) {}
+}
+
+// --- Terminal-name cache (feeds hook.js's OS-banner labels) ---
+//
+// The hook runs outside VS Code and can't see terminal names, so the
+// extension mirrors {pid: name} for all terminals into each workspace's
+// state dir. Written only when the map changes, plus a heartbeat rewrite
+// so readers can tell a live cache from a fossil after VS Code closes.
+// Last-writer-wins across windows sharing a workspace — a missed window's
+// entries return on its next heartbeat (worst case: banner falls back to
+// the AI title for up to a minute).
+
+let _nameCacheInFlight = false;
+let _nameCacheFingerprint = '';
+let _nameCacheLastWriteAt = 0;
+
+async function refreshTerminalNamesCache() {
+  if (_nameCacheInFlight) return;
+  _nameCacheInFlight = true;
+  try {
+    const folders = vscode.workspace.workspaceFolders || [];
+    if (folders.length === 0) return;
+    const terminals = vscode.window.terminals;
+    const descs = await Promise.all(terminals.map((t, i) => describeTerminalForMatch(t, i)));
+    const names = {};
+    for (const d of descs) {
+      if (d.pid && d.name) names[String(d.pid)] = d.name;
+    }
+    const fingerprint = JSON.stringify(names);
+    const now = Date.now();
+    if (fingerprint === _nameCacheFingerprint && now - _nameCacheLastWriteAt < NAME_CACHE_HEARTBEAT_MS) {
+      return;
+    }
+    // A window can host multi-root workspaces and terminals aren't tied to
+    // a folder, so every folder gets the full map; lookups are by pid.
+    for (const folder of folders) {
+      writeTerminalNamesCache(folder.uri.fsPath, names);
+    }
+    _nameCacheFingerprint = fingerprint;
+    _nameCacheLastWriteAt = now;
+  } catch (_) {
+  } finally {
+    _nameCacheInFlight = false;
+  }
 }
 
 // --- Signal handling (atomic claim-based) ---
@@ -235,6 +318,8 @@ async function handleSignal(signalPath, workspaceRoot, log) {
   log.appendLine(`Signal: event=${signal.event}(${rawEvent}), session=${sessionTag}, project=${signal.project}, pids=[${signal.pids.join(',')}], version=${signal.version}`);
   if (signal.aiTitle) log.appendLine(`  title: ${signal.aiTitle}`);
   if (signal.hookMessage) log.appendLine(`  message: ${signal.hookMessage}`);
+  if (signal.question) log.appendLine(`  question: ${signal.question}`);
+  if (signal.customName) log.appendLine(`  customName: ${signal.customName}`);
 
   const config = readConfig();
   const eventSetting = (config.events && config.events[signal.event]) || 'Sound + Notification';
@@ -247,8 +332,11 @@ async function handleSignal(signalPath, workspaceRoot, log) {
   }
 
   // Atomically claim. Whoever creates the handled-marker first wins.
-  // If hook.js beat us to it, skip silently.
-  if (!claimHandled(getClaimedPath(workspaceRoot))) {
+  // If hook.js beat us to it, skip silently. The sessionId:stageId tag
+  // lets this claim steal a marker left by a PREVIOUS attention point
+  // (cross-stage) while still deferring to a same-point claim.
+  const claimTag = (signal.sessionId && signal.stageId) ? `${signal.sessionId}:${signal.stageId}` : '';
+  if (!claimHandled(getClaimedPath(workspaceRoot), { tag: claimTag })) {
     log.appendLine('Signal already claimed by hook.js — skipping');
     // Treat the signal as fired so the ignored state holds.
     markSignalFired(signalPath);
@@ -294,6 +382,7 @@ async function handleSignal(signalPath, workspaceRoot, log) {
   // no match → toast) instead of two (matches → sound only, doesn't →
   // toast).
   const activeTerminal = vscode.window.activeTerminal;
+  let matchedCustomName = '';
   try {
     const allTerminals = vscode.window.terminals;
     const allDescs = await Promise.all(
@@ -301,6 +390,14 @@ async function handleSignal(signalPath, workspaceRoot, log) {
     );
     log.appendLine(`Open terminals (${allDescs.length}): ${allDescs.map(d => `[${d.index}]"${d.name}"(pid=${d.pid},cwd=${d.cwd || '?'})`).join(', ')}`);
     const m = matchTerminal(allDescs, signal);
+    // If the signal's terminal has a user-renamed tab, prefer that name in
+    // the toast — the live API name beats the hook's cache snapshot.
+    if (m) {
+      const d = allDescs[m.index];
+      if (d && isCustomTerminalName(d.name, { aiTitle: signal.aiTitle, project: signal.project })) {
+        matchedCustomName = d.name.trim();
+      }
+    }
     const activeIndex = activeTerminal ? allTerminals.indexOf(activeTerminal) : -1;
     if (m && m.index === activeIndex) {
       const cfg = vscode.workspace.getConfiguration('claudeNotifications');
@@ -317,11 +414,7 @@ async function handleSignal(signalPath, workspaceRoot, log) {
         // auto-dismisses info popups without actions after a few
         // seconds. Same dedup invariant applies: do not call
         // markResolved here either; this is not an explicit user ack.
-        const baseMsg = signal.event === 'completed'
-          ? `Task completed in: ${signal.project}`
-          : `Waiting for your response in: ${signal.project}`;
-        const msg = signal.aiTitle ? `${baseMsg} — ${signal.aiTitle}` : baseMsg;
-        vscode.window.showInformationMessage(msg);
+        vscode.window.showInformationMessage(buildToastMessage(signal, matchedCustomName));
       }
       return;
     }
@@ -338,11 +431,7 @@ async function handleSignal(signalPath, workspaceRoot, log) {
   if (wantSound) playEventSound(signal.event, config);
 
   if (wantToast) {
-    const baseMsg = signal.event === 'completed'
-      ? `Task completed in: ${signal.project}`
-      : `Waiting for your response in: ${signal.project}`;
-    const msg = signal.aiTitle ? `${baseMsg} — ${signal.aiTitle}` : baseMsg;
-    const action = await vscode.window.showInformationMessage(msg, 'Focus Terminal');
+    const action = await vscode.window.showInformationMessage(buildToastMessage(signal, matchedCustomName), 'Focus Terminal');
 
     if (action === 'Focus Terminal') {
       log.appendLine('User clicked Focus Terminal');
@@ -350,6 +439,24 @@ async function handleSignal(signalPath, workspaceRoot, log) {
       markResolved(workspaceRoot, signal.sessionId);
     }
   }
+}
+
+/**
+ * Toast text for a signal. Shows the actual question when the hook was able
+ * to extract it from an AskUserQuestion tool_input; otherwise the generic
+ * per-event line with an identity suffix: the user's custom terminal name
+ * when the tab was renamed (live match first, then the hook's cache lookup
+ * carried in the signal), else the AI session title.
+ */
+function buildToastMessage(signal, matchedCustomName = '') {
+  if (signal.event !== 'completed' && signal.question) {
+    return `Question in ${signal.project}: ${signal.question}`;
+  }
+  const label = matchedCustomName || signal.customName || signal.aiTitle;
+  const baseMsg = signal.event === 'completed'
+    ? `Task completed in: ${signal.project}`
+    : `Waiting for your response in: ${signal.project}`;
+  return label ? `${baseMsg} — ${label}` : baseMsg;
 }
 
 /**
@@ -493,7 +600,11 @@ function markSignalFired(signalPath) {
     const data = JSON.parse(content);
     if (data.state !== 'fired') {
       data.state = 'fired';
-      fs.writeFileSync(signalPath, JSON.stringify(data, null, 2));
+      // temp+rename so hook.js (which may re-read the signal after its
+      // handshake sleep) can never observe a torn write.
+      const tmp = `${signalPath}.tmp.${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+      fs.renameSync(tmp, signalPath);
     }
   } catch (_) {}
 }
@@ -711,7 +822,9 @@ async function cmdSetupHooks(context, log) {
 
   if (result.success) {
     log.appendLine(`Hooks installed. Backup: ${result.backupPath}`);
-    vscode.window.showInformationMessage(result.message);
+    vscode.window.showInformationMessage(
+      `${result.message} Restart any running 'claude' sessions to pick them up.`
+    );
     updateStatusBar(_statusBarItem, context.extensionPath);
     syncSettingsToConfig(context.extensionPath, log);
 
@@ -749,9 +862,22 @@ async function cmdRemoveHooks(log) {
 async function cmdTestNotification(context, log) {
   const hookPath = path.join(context.extensionPath, 'dist', 'hook.js');
   const { spawn } = require('child_process');
-  const child = spawn('node', [hookPath], {
-    env: { ...process.env, CLAUDE_PROJECT_DIR: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir() },
+  // Run the hook with VS Code's own bundled Node (ELECTRON_RUN_AS_NODE)
+  // instead of a bare `node` — VS Code launched from the Dock/Start Menu
+  // often has no `node` on PATH (nvm/fnm setups), which made the test
+  // command fail silently (and an unhandled spawn 'error' event could
+  // take the extension host down).
+  const child = spawn(process.execPath, [hookPath], {
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
+      CLAUDE_PROJECT_DIR: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir()
+    },
     stdio: ['pipe', 'pipe', 'pipe']
+  });
+  child.on('error', (err) => {
+    log.appendLine(`Test notification failed to spawn: ${err.message}`);
+    vscode.window.showErrorMessage(`Claude Notifications: test failed to run — ${err.message}`);
   });
   child.stdin.end('{"hook_event_name":"Notification"}');
   child.on('close', (code) => {
@@ -1041,7 +1167,7 @@ async function runFirstRunChecks(context, log, statusBarItem) {
     if (result.success) {
       log.appendLine('Hooks installed on first run');
       vscode.window.showInformationMessage(
-        'Claude Notifications: Hooks installed. You\'ll now get notified when Claude needs attention.'
+        'Claude Notifications: Hooks installed. Restart any running \'claude\' sessions to activate — Claude reads its hook config once at startup.'
       );
       updateStatusBar(statusBarItem, context.extensionPath);
       syncSettingsToConfig(context.extensionPath, log);
@@ -1058,7 +1184,7 @@ async function runFirstRunChecks(context, log, statusBarItem) {
       if (result.success) {
         log.appendLine('Legacy shell-script hooks auto-upgraded to Node.js hooks');
         vscode.window.showInformationMessage(
-          'Claude Notifications: upgraded legacy shell-script hooks to the new Node.js hooks.'
+          'Claude Notifications: upgraded legacy shell-script hooks to the new Node.js hooks. Restart any running \'claude\' sessions to pick them up.'
         );
         updateStatusBar(statusBarItem, context.extensionPath);
         syncSettingsToConfig(context.extensionPath, log);
@@ -1267,7 +1393,8 @@ function soundDisplayName(value, customPath) {
     return `${platformLabel()} · ${name}`;
   }
   if (value === 'custom') {
-    const tail = customPath ? customPath.split('/').pop() : '(no file selected)';
+    // Split on both separators — Windows custom paths use backslashes.
+    const tail = customPath ? customPath.split(/[\\/]/).pop() : '(no file selected)';
     return `Custom file · ${tail}`;
   }
   return value;

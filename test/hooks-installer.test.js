@@ -83,8 +83,9 @@ const WRAPPER_USER_PROMPT = '/home/u/.claude/claude-notifications/hook-user-prom
 const LEGACY_3_4 = '/home/u/.vscode/extensions/dimokol.claude-notifications-3.4.0/dist/hook.js';
 const LEGACY_3_3 = '/home/u/.vscode/extensions/dimokol.claude-notifications-3.3.2/dist/hook.js';
 
-function buildWrapperSettings({ includeUserPrompt = true } = {}) {
-  // Notification hooks carry async:true (current valid install shape).
+function buildWrapperSettings({ includeUserPrompt = true, includeQuestionHook = true } = {}) {
+  // Notification hooks carry async:true; PreToolUse question hook present
+  // (current valid install shape as of 3.6.0).
   const entry = (c, extra = {}) => ({ matcher: '', hooks: [{ type: 'command', command: c, ...extra }] });
   const cmd = `node "${WRAPPER_HOOK}"`;
   const userPromptCmd = `node "${WRAPPER_USER_PROMPT}"`;
@@ -93,6 +94,9 @@ function buildWrapperSettings({ includeUserPrompt = true } = {}) {
     Notification: [entry(cmd, { async: true })],
     PermissionRequest: [entry(cmd, { async: true })]
   };
+  if (includeQuestionHook) {
+    hooks.PreToolUse = [{ matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: cmd, async: true }] }];
+  }
   if (includeUserPrompt) hooks.UserPromptSubmit = [entry(userPromptCmd)];
   return { hooks };
 }
@@ -200,7 +204,7 @@ test('installHooks is idempotent on Windows-style paths (no duplicate accumulati
   }
 
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-  for (const event of ['Stop', 'Notification', 'PermissionRequest', 'UserPromptSubmit']) {
+  for (const event of ['Stop', 'Notification', 'PermissionRequest', 'PreToolUse', 'UserPromptSubmit']) {
     assert.strictEqual(
       Array.isArray(settings.hooks[event]) && settings.hooks[event].length,
       1,
@@ -394,7 +398,89 @@ test('installHooks is idempotent on POSIX paths (no duplicate accumulation)', ()
   }
 
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-  for (const event of ['Stop', 'Notification', 'PermissionRequest', 'UserPromptSubmit']) {
+  for (const event of ['Stop', 'Notification', 'PermissionRequest', 'PreToolUse', 'UserPromptSubmit']) {
     assert.strictEqual(settings.hooks[event].length, 1);
   }
+});
+
+// --- 3.6.0 question hook (PreToolUse / AskUserQuestion) ---
+
+test('installHooks writes a PreToolUse entry scoped to AskUserQuestion only', () => {
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+
+  const wrapper = {
+    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+  };
+  const r = installHooks(wrapper, { settingsPath });
+  assert.strictEqual(r.success, true, r.message);
+
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  const preToolUse = settings.hooks.PreToolUse;
+  assert.strictEqual(preToolUse.length, 1);
+  assert.strictEqual(preToolUse[0].matcher, 'AskUserQuestion',
+    'question hook must be scoped to AskUserQuestion — a bare matcher would fire for every tool call');
+  assert.strictEqual(preToolUse[0].hooks[0].async, true, 'question hook should be async');
+  assert.ok(preToolUse[0].hooks[0].command.includes('hook.cjs'));
+});
+
+test('installHooks preserves foreign PreToolUse entries (user\'s own hooks)', () => {
+  // Users commonly have their own PreToolUse hooks (guards, linters). The
+  // strip-before-push filter must only remove OUR entries from that array.
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  const foreign = { matcher: 'Bash', hooks: [{ type: 'command', command: 'sh "/Users/dimo/.claude-shared/hooks/no-auto-merge.sh"' }] };
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { PreToolUse: [foreign] } }, null, 2));
+
+  const wrapper = {
+    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+  };
+  installHooks(wrapper, { settingsPath });
+  installHooks(wrapper, { settingsPath }); // idempotency with a foreign entry present
+
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  assert.strictEqual(settings.hooks.PreToolUse.length, 2, 'foreign + ours');
+  assert.deepStrictEqual(settings.hooks.PreToolUse[0], foreign, 'foreign entry must survive untouched');
+  assert.strictEqual(settings.hooks.PreToolUse[1].matcher, 'AskUserQuestion');
+});
+
+test('checkHookStatus reports stale-config for a 3.5.x install missing the question hook', () => {
+  // Auto-migration driver: a correct-path async install WITHOUT the
+  // PreToolUse question hook (i.e. any 3.5.x install) must be flagged so
+  // activation rewrites it — otherwise existing users never gain the
+  // redundant question announcement channel.
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  writeSettings(settingsPath, buildWrapperSettings({ includeQuestionHook: false }));
+
+  const status = checkHookStatus(WRAPPER_HOOK, settingsPath);
+  assert.strictEqual(status.status, 'stale-config',
+    `expected 'stale-config' for a pre-3.6.0 install without the question hook, got '${status.status}'`);
+});
+
+test('uninstallHooks removes our PreToolUse entry but keeps foreign ones', () => {
+  const home = makeTempHome();
+  const settingsPath = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  const foreign = { matcher: 'Bash', hooks: [{ type: 'command', command: 'sh "/Users/dimo/hooks/guard.sh"' }] };
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { PreToolUse: [foreign] } }, null, 2));
+
+  const wrapper = {
+    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+  };
+  installHooks(wrapper, { settingsPath });
+
+  const { uninstallHooks } = require('../lib/hooks-installer');
+  const r = uninstallHooks(settingsPath);
+  assert.strictEqual(r.success, true);
+
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  assert.deepStrictEqual(settings.hooks.PreToolUse, [foreign],
+    'only the foreign PreToolUse entry should remain after uninstall');
+  assert.strictEqual(settings.hooks.Stop, undefined, 'our Stop entry should be gone');
 });

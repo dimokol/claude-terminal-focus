@@ -11,6 +11,7 @@ var require_signals = __commonJS({
     var SIGNAL_VERSION = 2;
     var STALE_THRESHOLD_MS = 3e4;
     var CLAIM_STALE_MS = 5e3;
+    var CLAIM_CROSS_STAGE_STEAL_MS = 2e3;
     var EVENT_PRIORITY = { completed: 1, waiting: 2 };
     function eventPriority2(event) {
       return EVENT_PRIORITY[event] || 0;
@@ -20,9 +21,14 @@ var require_signals = __commonJS({
       if (event === "stop") return "completed";
       return "waiting";
     }
-    function claimHandled2(handledPath, staleMs = CLAIM_STALE_MS) {
+    function claimHandled2(handledPath, opts = {}) {
+      if (typeof opts === "number") opts = { staleMs: opts };
+      const staleMs = opts.staleMs != null ? opts.staleMs : CLAIM_STALE_MS;
+      const crossTagStealMs = opts.crossTagStealMs != null ? opts.crossTagStealMs : CLAIM_CROSS_STAGE_STEAL_MS;
+      const tag = typeof opts.tag === "string" ? opts.tag : "";
+      const markerContent = () => `${Date.now()}:${tag}`;
       try {
-        fs2.writeFileSync(handledPath, String(Date.now()), { flag: "wx" });
+        fs2.writeFileSync(handledPath, markerContent(), { flag: "wx" });
         return true;
       } catch (err) {
         if (err.code !== "EEXIST") return false;
@@ -32,20 +38,31 @@ var require_signals = __commonJS({
         stat = fs2.statSync(handledPath);
       } catch (_) {
         try {
-          fs2.writeFileSync(handledPath, String(Date.now()), { flag: "wx" });
+          fs2.writeFileSync(handledPath, markerContent(), { flag: "wx" });
           return true;
         } catch (_2) {
           return false;
         }
       }
-      if (Date.now() - stat.mtimeMs <= staleMs) return false;
+      let effectiveStaleMs = staleMs;
+      if (tag) {
+        let markerTag = "";
+        try {
+          const raw = fs2.readFileSync(handledPath, "utf8");
+          const sep = raw.indexOf(":");
+          if (sep !== -1) markerTag = raw.slice(sep + 1);
+        } catch (_) {
+        }
+        if (markerTag && markerTag !== tag) effectiveStaleMs = crossTagStealMs;
+      }
+      if (Date.now() - stat.mtimeMs <= effectiveStaleMs) return false;
       try {
         fs2.unlinkSync(handledPath);
       } catch (_) {
         return false;
       }
       try {
-        fs2.writeFileSync(handledPath, String(Date.now()), { flag: "wx" });
+        fs2.writeFileSync(handledPath, markerContent(), { flag: "wx" });
         return true;
       } catch (_) {
         return false;
@@ -66,7 +83,10 @@ var require_signals = __commonJS({
               event: normalizeEvent(data.event || "notification"),
               hookEventName: typeof data.hookEventName === "string" ? data.hookEventName : "",
               hookMessage: typeof data.hookMessage === "string" ? data.hookMessage : "",
+              question: typeof data.question === "string" ? data.question : "",
+              customName: typeof data.customName === "string" ? data.customName : "",
               sessionId: typeof data.sessionId === "string" ? data.sessionId : "",
+              stageId: Number.isInteger(data.stageId) && data.stageId > 0 ? data.stageId : 0,
               project: data.project || "Unknown",
               projectDir: data.projectDir || "",
               workspaceRoot: typeof data.workspaceRoot === "string" ? data.workspaceRoot : "",
@@ -82,13 +102,18 @@ var require_signals = __commonJS({
         } catch (_) {
         }
       }
-      const pids = trimmed.split(/\r?\n/).map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
+      const lines = trimmed.split(/\r?\n/).map((s) => s.trim()).filter((s) => s !== "");
+      if (lines.length === 0 || !lines.every((s) => /^\d+$/.test(s))) return null;
+      const pids = lines.map((s) => parseInt(s, 10)).filter((n) => !isNaN(n) && n > 0);
       return {
         version: 1,
         event: "waiting",
         hookEventName: "",
         hookMessage: "",
+        question: "",
+        customName: "",
         sessionId: "",
+        stageId: 0,
         project: "Claude Code",
         projectDir: "",
         workspaceRoot: "",
@@ -105,6 +130,7 @@ var require_signals = __commonJS({
       SIGNAL_VERSION,
       STALE_THRESHOLD_MS,
       CLAIM_STALE_MS,
+      CLAIM_CROSS_STAGE_STEAL_MS,
       claimHandled: claimHandled2,
       eventPriority: eventPriority2,
       normalizeEvent,
@@ -119,7 +145,9 @@ var require_state_paths = __commonJS({
     var crypto = require("crypto");
     var os2 = require("os");
     var path2 = require("path");
-    var STATE_ROOT = path2.join(os2.homedir(), ".claude", "focus-state");
+    function getStateRoot() {
+      return path2.join(os2.homedir(), ".claude", "focus-state");
+    }
     function normalizeWorkspaceRoot(workspaceRoot) {
       let s = String(workspaceRoot).replace(/\\/g, "/");
       if (process.platform === "win32") {
@@ -134,7 +162,7 @@ var require_state_paths = __commonJS({
       return crypto.createHash("sha1").update(normalizeWorkspaceRoot(workspaceRoot)).digest("hex").slice(0, 12);
     }
     function getStateDir2(workspaceRoot) {
-      return path2.join(STATE_ROOT, hashWorkspace(workspaceRoot));
+      return path2.join(getStateRoot(), hashWorkspace(workspaceRoot));
     }
     function getSignalPath2(workspaceRoot) {
       return path2.join(getStateDir2(workspaceRoot), "signal");
@@ -149,7 +177,7 @@ var require_state_paths = __commonJS({
       return path2.join(getStateDir2(workspaceRoot), "sessions");
     }
     module2.exports = {
-      STATE_ROOT,
+      getStateRoot,
       hashWorkspace,
       normalizeWorkspaceRoot,
       getStateDir: getStateDir2,
@@ -378,7 +406,7 @@ var require_stage_dedup = __commonJS({
 // lib/click-marker.js
 var require_click_marker = __commonJS({
   "lib/click-marker.js"(exports2, module2) {
-    var CLICK_MARKER_STALE_MS = 5 * 60 * 1e3;
+    var CLICK_MARKER_STALE_MS = 60 * 60 * 1e3;
     function parseClickMarker(content) {
       if (typeof content !== "string" || content.trim() === "") {
         return { legacy: true };
@@ -658,6 +686,245 @@ var require_code_build = __commonJS({
   }
 });
 
+// lib/hook-input.js
+var require_hook_input = __commonJS({
+  "lib/hook-input.js"(exports2, module2) {
+    var SKIP_NOTIFICATION_TYPES = /* @__PURE__ */ new Set([
+      "auth_success",
+      "elicitation_complete",
+      "elicitation_response"
+    ]);
+    var PRIMARY_NOTIFICATION_TYPES = {
+      agent_needs_input: { event: "waiting", dedupEventName: "AgentNotification" },
+      agent_completed: { event: "completed", dedupEventName: "AgentNotification" },
+      elicitation_dialog: { event: "waiting", dedupEventName: "ElicitationNotification" }
+    };
+    function classifyHookInput2(input) {
+      const raw = input && typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+      const lower = raw.toLowerCase();
+      if (lower === "stop") {
+        return { skip: false, event: "completed", hookEventName: raw, dedupEventName: raw };
+      }
+      if (lower === "notification") {
+        const nType = input && typeof input.notification_type === "string" ? input.notification_type : "";
+        if (SKIP_NOTIFICATION_TYPES.has(nType)) return { skip: true };
+        const primary = PRIMARY_NOTIFICATION_TYPES[nType];
+        if (primary) {
+          return { skip: false, event: primary.event, hookEventName: raw, dedupEventName: primary.dedupEventName };
+        }
+        return { skip: false, event: "waiting", hookEventName: raw, dedupEventName: raw };
+      }
+      return { skip: false, event: "waiting", hookEventName: raw, dedupEventName: raw };
+    }
+    var MAX_QUESTION_LEN = 120;
+    function extractQuestionText2(toolName, toolInput) {
+      if (toolName !== "AskUserQuestion") return "";
+      if (!toolInput || typeof toolInput !== "object") return "";
+      const questions = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+      const first = questions.find((q) => q && typeof q.question === "string" && q.question.trim() !== "");
+      if (!first) return "";
+      let text = first.question.trim().replace(/\s+/g, " ");
+      if (text.length > MAX_QUESTION_LEN) text = text.slice(0, MAX_QUESTION_LEN - 1) + "\u2026";
+      return text;
+    }
+    module2.exports = {
+      classifyHookInput: classifyHookInput2,
+      extractQuestionText: extractQuestionText2,
+      SKIP_NOTIFICATION_TYPES,
+      PRIMARY_NOTIFICATION_TYPES,
+      MAX_QUESTION_LEN
+    };
+  }
+});
+
+// lib/terminal-match.js
+var require_terminal_match = __commonJS({
+  "lib/terminal-match.js"(exports2, module2) {
+    var DEFAULT_SHELL_NAMES = /* @__PURE__ */ new Set([
+      "bash",
+      "powershell",
+      "pwsh",
+      "cmd",
+      "zsh",
+      "sh",
+      "fish",
+      "terminal",
+      "shell",
+      "git bash",
+      "command prompt"
+    ]);
+    var CLAUDE_TITLE_MARKERS = ["\u2733", "\u2692", "\u25A3", "\u273B"];
+    var PROJECT_NAME_MIN_LEN = 4;
+    function matchTerminal(terminals, signal) {
+      if (!Array.isArray(terminals) || terminals.length === 0) return null;
+      const sig = signal || {};
+      const pidSet = /* @__PURE__ */ new Set([
+        ...Array.isArray(sig.pids) ? sig.pids : [],
+        ...sig.shellPid ? [sig.shellPid] : []
+      ]);
+      const pidMatches = terminals.filter((t) => t.pid && pidSet.has(t.pid));
+      if (pidMatches.length === 1) {
+        const t = pidMatches[0];
+        const why = sig.shellPid === t.pid ? `shellPid=${t.pid}` : `pid=${t.pid} in signal.pids`;
+        return { index: t.index, tier: "pid", reason: why };
+      }
+      if (sig.shellPid && pidMatches.length === 0 && sig.pidChainSource === "ps") {
+        return null;
+      }
+      const workspaceRoot = normalizePath(sig.workspaceRoot || "");
+      const projectDir = normalizePath(sig.projectDir || "");
+      if (workspaceRoot || projectDir) {
+        const cwdMatches = terminals.filter((t) => {
+          const cwd = normalizePath(t.cwd || "");
+          if (!cwd) return false;
+          if (workspaceRoot && cwd === workspaceRoot) return true;
+          if (projectDir && cwd === projectDir) return true;
+          if (workspaceRoot && cwd.startsWith(workspaceRoot + "/")) return true;
+          if (projectDir && cwd.startsWith(projectDir + "/")) return true;
+          return false;
+        });
+        if (cwdMatches.length === 1) {
+          const t = cwdMatches[0];
+          return { index: t.index, tier: "cwd", reason: `cwd=${t.cwd}` };
+        }
+      }
+      const aiTitle = (sig.aiTitle || "").trim();
+      if (aiTitle && aiTitle.length >= 4) {
+        const titleMatches = terminals.filter((t) => (t.name || "").includes(aiTitle));
+        if (titleMatches.length === 1) {
+          const t = titleMatches[0];
+          return { index: t.index, tier: "ai-title", reason: `name contains "${aiTitle}"` };
+        }
+      }
+      const project = (sig.project || "").toLowerCase();
+      const projectOk = project.length >= PROJECT_NAME_MIN_LEN;
+      const markerMatches = terminals.filter((t) => {
+        const name = t.name || "";
+        if (!name) return false;
+        for (const m of CLAUDE_TITLE_MARKERS) {
+          if (name.includes(m)) return true;
+        }
+        const lower = name.toLowerCase();
+        if (lower.includes("claude")) return true;
+        if (projectOk && lower.includes(project)) return true;
+        return false;
+      });
+      if (markerMatches.length === 1) {
+        const t = markerMatches[0];
+        return { index: t.index, tier: "claude-marker", reason: `name="${t.name}"` };
+      }
+      const nonDefault = terminals.filter((t) => !isDefaultShellName(t.name));
+      if (nonDefault.length === 1) {
+        const t = nonDefault[0];
+        return { index: t.index, tier: "non-default-name", reason: `only non-default-named terminal: "${t.name}"` };
+      }
+      return null;
+    }
+    function isDefaultShellName(name) {
+      if (!name) return true;
+      const trimmed = name.trim().toLowerCase();
+      if (DEFAULT_SHELL_NAMES.has(trimmed)) return true;
+      const stripped = trimmed.replace(/\s*\(\d+\)\s*$/, "");
+      return DEFAULT_SHELL_NAMES.has(stripped);
+    }
+    function normalizePath(p) {
+      if (!p) return "";
+      let s = String(p).replace(/\\/g, "/").replace(/\/+$/, "");
+      if (/^[a-zA-Z]:\//.test(s)) s = s.charAt(0).toLowerCase() + s.slice(1);
+      return s;
+    }
+    module2.exports = {
+      matchTerminal,
+      isDefaultShellName,
+      normalizePath,
+      DEFAULT_SHELL_NAMES,
+      CLAUDE_TITLE_MARKERS
+    };
+  }
+});
+
+// lib/terminal-names.js
+var require_terminal_names = __commonJS({
+  "lib/terminal-names.js"(exports2, module2) {
+    var fs2 = require("fs");
+    var path2 = require("path");
+    var { getStateDir: getStateDir2 } = require_state_paths();
+    var { isDefaultShellName, CLAUDE_TITLE_MARKERS } = require_terminal_match();
+    var NAME_CACHE_HEARTBEAT_MS = 60 * 1e3;
+    var NAME_CACHE_STALE_MS = 5 * 60 * 1e3;
+    var MAX_CUSTOM_NAME_LEN = 60;
+    function isCustomTerminalName(name, { aiTitle = "", project = "" } = {}) {
+      if (typeof name !== "string") return false;
+      const trimmed = name.trim();
+      if (!trimmed) return false;
+      if (isDefaultShellName(trimmed)) return false;
+      for (const marker of CLAUDE_TITLE_MARKERS) {
+        if (trimmed.includes(marker)) return false;
+      }
+      const lower = trimmed.toLowerCase();
+      if (lower.includes("claude")) return false;
+      if (aiTitle && lower.includes(String(aiTitle).trim().toLowerCase())) return false;
+      const deduped = lower.replace(/\s*\(\d+\)\s*$/, "");
+      if (project && deduped === String(project).trim().toLowerCase()) return false;
+      return true;
+    }
+    function getTerminalNamesPath(workspaceRoot) {
+      return path2.join(getStateDir2(workspaceRoot), "terminal-names");
+    }
+    function writeTerminalNamesCache(workspaceRoot, names) {
+      try {
+        const dir = getStateDir2(workspaceRoot);
+        fs2.mkdirSync(dir, { recursive: true });
+        const p = getTerminalNamesPath(workspaceRoot);
+        const tmp = `${p}.tmp.${process.pid}`;
+        fs2.writeFileSync(tmp, JSON.stringify({ version: 1, updatedAt: Date.now(), names: names || {} }));
+        fs2.renameSync(tmp, p);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+    function readTerminalNamesCache2(workspaceRoot, staleMs = NAME_CACHE_STALE_MS) {
+      try {
+        const raw = fs2.readFileSync(getTerminalNamesPath(workspaceRoot), "utf8");
+        const data = JSON.parse(raw);
+        if (!data || typeof data !== "object" || !data.names || typeof data.names !== "object") return null;
+        if (typeof data.updatedAt !== "number" || Date.now() - data.updatedAt > staleMs) return null;
+        return data;
+      } catch (_) {
+        return null;
+      }
+    }
+    function lookupCustomName2(cache, { shellPid = 0, pids = [] } = {}, ctx = {}) {
+      if (!cache || !cache.names) return "";
+      const tryPid = (pid) => {
+        if (!pid) return "";
+        const name = cache.names[String(pid)];
+        if (typeof name !== "string" || !isCustomTerminalName(name, ctx)) return "";
+        const trimmed = name.trim();
+        return trimmed.length > MAX_CUSTOM_NAME_LEN ? trimmed.slice(0, MAX_CUSTOM_NAME_LEN - 1) + "\u2026" : trimmed;
+      };
+      const fromShell = tryPid(shellPid);
+      if (fromShell) return fromShell;
+      for (const pid of Array.isArray(pids) ? pids : []) {
+        const hit = tryPid(pid);
+        if (hit) return hit;
+      }
+      return "";
+    }
+    module2.exports = {
+      isCustomTerminalName,
+      getTerminalNamesPath,
+      writeTerminalNamesCache,
+      readTerminalNamesCache: readTerminalNamesCache2,
+      lookupCustomName: lookupCustomName2,
+      NAME_CACHE_HEARTBEAT_MS,
+      NAME_CACHE_STALE_MS,
+      MAX_CUSTOM_NAME_LEN
+    };
+  }
+});
+
 // hook.js
 var fs = require("fs");
 var path = require("path");
@@ -677,6 +944,8 @@ var { buildClickMarkerPayload } = require_click_marker();
 var { readAiTitle } = require_transcript_title();
 var { snapshot: processSnapshot, walkUp } = require_process_tree();
 var { schemeForBinaryName, classifyBuild } = require_code_build();
+var { classifyHookInput, extractQuestionText } = require_hook_input();
+var { readTerminalNamesCache, lookupCustomName } = require_terminal_names();
 var SHELL_PROCESS_NAMES = /* @__PURE__ */ new Set([
   "bash.exe",
   "sh.exe",
@@ -686,6 +955,7 @@ var SHELL_PROCESS_NAMES = /* @__PURE__ */ new Set([
   "cmd.exe",
   "fish.exe",
   "wsl.exe",
+  "nu.exe",
   // POSIX (no .exe), as reported by `ps -o comm=`. Includes the
   // login-shell '-' prefix variants.
   "bash",
@@ -697,12 +967,55 @@ var SHELL_PROCESS_NAMES = /* @__PURE__ */ new Set([
   "pwsh",
   "powershell",
   "fish",
-  "-fish"
+  "-fish",
+  "dash",
+  "-dash",
+  "ksh",
+  "-ksh",
+  "tcsh",
+  "-tcsh",
+  "csh",
+  "-csh",
+  "nu"
 ]);
 var CONFIG_FILE = "claude-notifications-config.json";
 var DEFAULT_HANDSHAKE_MS = 1200;
 function shEsc(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+function writeFileAtomic(p, data) {
+  const tmp = `${p}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_) {
+    }
+    throw err;
+  }
+}
+var MAC_BIN_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"];
+function findMacBinary(name) {
+  for (const dir of MAC_BIN_DIRS) {
+    const p = `${dir}/${name}`;
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return p;
+    } catch (_) {
+    }
+  }
+  try {
+    const stdout = execSync(`command -v ${name}`, {
+      encoding: "utf8",
+      timeout: 2e3,
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    return stdout || null;
+  } catch (_) {
+    return null;
+  }
 }
 function buildHiddenPsArgv(tmpScript) {
   const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
@@ -737,19 +1050,25 @@ function xmlEsc(s) {
   const projectName = path.basename(projectDir);
   let hookEvent = "waiting";
   let hookEventName = "";
+  let dedupEventName = "";
   let hookMessage = "";
   let sessionId = "";
   let transcriptPath = "";
+  let question = "";
   try {
     const stdinData = fs.readFileSync(0, "utf8");
     const input = JSON.parse(stdinData);
-    hookEventName = input.hook_event_name || "";
     hookMessage = typeof input.message === "string" ? input.message : "";
     sessionId = input.session_id || "";
     transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
-    const eventName = hookEventName.toLowerCase();
-    if (eventName === "stop") hookEvent = "completed";
-    else hookEvent = "waiting";
+    const cls = classifyHookInput(input);
+    if (cls.skip) process.exit(0);
+    hookEvent = cls.event;
+    hookEventName = cls.hookEventName;
+    dedupEventName = cls.dedupEventName;
+    const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
+    const toolInput = input.tool_input && typeof input.tool_input === "object" ? input.tool_input : null;
+    question = extractQuestionText(toolName, toolInput);
   } catch (_) {
   }
   const MAX_TITLE_LEN = 60;
@@ -788,10 +1107,11 @@ function xmlEsc(s) {
   const signalPath = getSignalPath(workspaceRoot);
   const claimPath = getClaimedPath(workspaceRoot);
   const clickedPath = getClickedPath(workspaceRoot);
-  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent, hookEventName);
+  const dedup = checkShouldNotify(workspaceRoot, sessionId, hookEvent, dedupEventName || hookEventName);
   if (!dedup.notify) {
     process.exit(0);
   }
+  const claimTag = sessionId && dedup.stageId ? `${sessionId}:${dedup.stageId}` : "";
   const snap = processSnapshot();
   const chain = walkUp(snap, process.pid);
   const pids = chain.map((n) => n.pid);
@@ -817,6 +1137,11 @@ function xmlEsc(s) {
     );
   } catch (_) {
   }
+  const customName = lookupCustomName(
+    readTerminalNamesCache(workspaceRoot),
+    { shellPid, pids },
+    { aiTitle, project: projectName }
+  );
   let shouldWriteSignal = true;
   try {
     const existing = JSON.parse(fs.readFileSync(signalPath, "utf8"));
@@ -831,7 +1156,10 @@ function xmlEsc(s) {
       event: hookEvent,
       hookEventName,
       hookMessage,
+      question: question || void 0,
+      customName: customName || void 0,
       sessionId,
+      stageId: dedup.stageId || void 0,
       project: projectName,
       projectDir,
       workspaceRoot,
@@ -843,7 +1171,10 @@ function xmlEsc(s) {
       aiTitle,
       timestamp: Date.now()
     };
-    fs.writeFileSync(signalPath, JSON.stringify(signalPayload, null, 2));
+    try {
+      writeFileAtomic(signalPath, JSON.stringify(signalPayload, null, 2));
+    } catch (_) {
+    }
   }
   if (isMuted) process.exit(0);
   const eventConfig = config.events && config.events[hookEvent] || "Sound + Notification";
@@ -854,7 +1185,11 @@ function xmlEsc(s) {
     completed: { title: "Claude Code \u2014 Done", message: `Task completed in: ${projectName}`, sound: "task-complete" },
     waiting: { title: "Claude Code", message: `Waiting for your response in: ${projectName}`, sound: "notification" }
   };
-  const eventInfo = eventMessages[hookEvent] || eventMessages.waiting;
+  const eventInfo = { ...eventMessages[hookEvent] || eventMessages.waiting };
+  if (hookEvent === "waiting" && question) {
+    eventInfo.message = `Question in ${projectName}: ${question}`;
+  }
+  const bannerLabel = customName || aiTitle;
   const handshakeMs = config.handshakeMs || DEFAULT_HANDSHAKE_MS;
   await sleep(handshakeMs);
   try {
@@ -865,13 +1200,13 @@ function xmlEsc(s) {
   } catch (_) {
     process.exit(0);
   }
-  if (!claimHandled(claimPath)) {
+  if (!claimHandled(claimPath, { tag: claimTag })) {
     process.exit(0);
   }
   try {
     const onDisk = JSON.parse(fs.readFileSync(signalPath, "utf8"));
     onDisk.state = "fired";
-    fs.writeFileSync(signalPath, JSON.stringify(onDisk, null, 2));
+    writeFileAtomic(signalPath, JSON.stringify(onDisk, null, 2));
   } catch (_) {
   }
   if (shouldPlaySound) {
@@ -946,47 +1281,50 @@ try {} finally { Remove-Item -LiteralPath '${tmpSoundScript.replace(/'/g, "''")}
   }
   if (process.platform === "darwin") {
     const codeCli = findCodeCli();
-    try {
-      execSync("command -v terminal-notifier", { stdio: "ignore" });
-      const clickPayload = buildClickMarkerPayload({
-        sessionId,
-        pids,
-        shellPid,
-        workspaceRoot,
-        projectDir,
-        event: hookEvent,
-        project: projectName,
-        aiTitle
-      });
-      const executeCmd = `/usr/bin/printf '%s' ${shEsc(clickPayload)} > ${shEsc(clickedPath)} && ${shEsc(codeCli)} ${shEsc(workspaceRoot)}`;
-      const notifierArgs = [
-        "-title",
-        eventInfo.title,
-        "-message",
-        eventInfo.message,
-        "-execute",
-        executeCmd,
-        "-group",
-        `claude-${projectName}`
-      ];
-      if (aiTitle) {
-        notifierArgs.splice(2, 0, "-subtitle", aiTitle);
-      }
-      const child = spawn("terminal-notifier", notifierArgs, { detached: true, stdio: "ignore" });
-      child.unref();
-    } catch (_) {
+    const tnBinary = findMacBinary("terminal-notifier");
+    if (tnBinary) {
       try {
-        const osaTitle = aiTitle ? `${eventInfo.title} \u2014 ${aiTitle.replace(/"/g, '\\"')}` : eventInfo.title;
-        execSync(`osascript -e 'display notification "${eventInfo.message}" with title "${osaTitle}"'`, {
-          timeout: 3e3,
-          stdio: "ignore"
+        const clickPayload = buildClickMarkerPayload({
+          sessionId,
+          pids,
+          shellPid,
+          workspaceRoot,
+          projectDir,
+          event: hookEvent,
+          project: projectName,
+          aiTitle
         });
-      } catch (_2) {
+        const executeCmd = `/usr/bin/printf '%s' ${shEsc(clickPayload)} > ${shEsc(clickedPath)} && ${shEsc(codeCli)} ${shEsc(workspaceRoot)}`;
+        const notifierArgs = [
+          "-title",
+          eventInfo.title,
+          "-message",
+          eventInfo.message,
+          "-execute",
+          executeCmd,
+          "-group",
+          `claude-${projectName}`
+        ];
+        if (bannerLabel) {
+          notifierArgs.splice(2, 0, "-subtitle", bannerLabel);
+        }
+        const child = spawn(tnBinary, notifierArgs, { detached: true, stdio: "ignore" });
+        child.unref();
+      } catch (_) {
+      }
+    } else {
+      try {
+        const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        const osaTitle = bannerLabel ? `${eventInfo.title} \u2014 ${bannerLabel}` : eventInfo.title;
+        const script = `display notification "${esc(eventInfo.message)}" with title "${esc(osaTitle)}"`;
+        const child = spawn("osascript", ["-e", script], { detached: true, stdio: "ignore" });
+        child.unref();
+      } catch (_) {
       }
     }
   } else if (process.platform === "win32") {
     const tmpScript = path.join(os.tmpdir(), `claude-notif-${Date.now()}-${process.pid}.ps1`);
-    const titleLine = aiTitle ? `    <text>${xmlEsc(aiTitle)}</text>` : "";
+    const titleLine = bannerLabel ? `    <text>${xmlEsc(bannerLabel)}</text>` : "";
     const clickMarkerJson = buildClickMarkerPayload({
       sessionId,
       pids,

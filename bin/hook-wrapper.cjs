@@ -133,6 +133,55 @@ function selfDestruct({ home = os.homedir(), wrapperDir = __dirname } = {}) {
   }
 }
 
+// Compare dotted version strings numerically ("3.10.0" > "3.9.9").
+// Non-numeric segments compare as 0.
+function compareVersions(a, b) {
+  const pa = String(a).split('.');
+  const pb = String(b).split('.');
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const na = parseInt(pa[i], 10) || 0;
+    const nb = parseInt(pb[i], 10) || 0;
+    if (na !== nb) return na - nb;
+  }
+  return 0;
+}
+
+// The recorded hook path looks like
+//   <extensionsRoot>/dimokol.claude-notifications-<version>/dist/hook.js
+// When it's gone, scan <extensionsRoot> for the newest still-installed
+// version of the extension and return its matching dist bundle. This is
+// what distinguishes "the user uninstalled the extension" (self-destruct)
+// from "VS Code replaced the version dir during an update and our state
+// file is momentarily stale" (re-point and keep working). Without this, a
+// Claude hook firing inside the update window stripped every profile's
+// hooks mid-session — notifications silently died until the next VS Code
+// activation reinstalled them AND the user restarted `claude`.
+function findNewestExtensionHook(recordedPath, isUserPrompt, fsLike = fs) {
+  if (typeof recordedPath !== 'string' || recordedPath === '') return null;
+  try {
+    const extRoot = path.dirname(path.dirname(path.dirname(recordedPath)));
+    const prefix = 'dimokol.claude-notifications-';
+    const file = isUserPrompt ? 'hook-user-prompt.js' : 'hook.js';
+    let entries;
+    try { entries = fsLike.readdirSync(extRoot, { withFileTypes: true }); }
+    catch (_) { return null; }
+    const candidates = [];
+    for (const e of entries) {
+      if (!e.isDirectory() || !e.name.startsWith(prefix)) continue;
+      const hookPath = path.join(extRoot, e.name, 'dist', file);
+      let exists = false;
+      try { fsLike.accessSync(hookPath); exists = true; } catch (_) {}
+      if (exists) candidates.push({ version: e.name.slice(prefix.length), hookPath, dir: path.join(extRoot, e.name) });
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => compareVersions(b.version, a.version));
+    return candidates[0];
+  } catch (_) {
+    return null;
+  }
+}
+
 function main() {
   const stateFile = path.join(__dirname, 'state.json');
   const isUserPrompt = path.basename(__filename) === 'hook-user-prompt.cjs';
@@ -141,13 +190,28 @@ function main() {
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); }
   catch (_) { process.exit(0); }
 
-  const target = isUserPrompt
+  let target = isUserPrompt
     ? state.extensionUserPromptHookPath
     : state.extensionHookPath;
 
   if (!target || !pathExistsSync(target)) {
-    try { selfDestruct(); } catch (_) {}
-    process.exit(0);
+    // Recorded bundle is gone. If ANY version of the extension is still
+    // installed, this is an update in flight, not an uninstall — re-point
+    // state.json at the newest one and keep serving hooks.
+    const recorded = state.extensionHookPath || state.extensionUserPromptHookPath || '';
+    const newest = findNewestExtensionHook(recorded, isUserPrompt);
+    if (newest) {
+      target = newest.hookPath;
+      try {
+        state.extensionHookPath = path.join(newest.dir, 'dist', 'hook.js');
+        state.extensionUserPromptHookPath = path.join(newest.dir, 'dist', 'hook-user-prompt.js');
+        state.extensionVersion = newest.version;
+        fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+      } catch (_) {}
+    } else {
+      try { selfDestruct(); } catch (_) {}
+      process.exit(0);
+    }
   }
 
   // require() runs the target's IIFE in-process; stdin, argv, and
@@ -175,6 +239,8 @@ module.exports = {
   discoverProfiles,
   stripFromSettings,
   selfDestruct,
+  compareVersions,
+  findNewestExtensionHook,
   SELF_IDENTIFIERS,
   main
 };

@@ -21,43 +21,31 @@ Works on **macOS**, **Windows**, and **Linux**, across multiple VS Code windows 
 
 2. **That's it.** Hooks are installed automatically on first activation, no prompts, no clicks. You'll see a confirmation toast and the status bar shows `$(bell) Claude: Notify`.
 
+3. **Restart any `claude` session that was already running.** Claude Code reads its hook config once at startup, so sessions started before the install won't fire notifications until restarted.
+
    If you ever need to re-run setup: `Ctrl/Cmd+Shift+P` → **"Claude Notifications: Set Up Claude Code Hooks"**.
 
-## What's New in v3.5.5
+## What's New in v3.6.0
 
-A big maintenance release rolling up everything since the last Marketplace publish (v3.3.2).
+A reliability release focused on the "never zero, never two" notification guarantee.
 
-### Windows notifications work reliably end-to-end
-- **OS toast fires every time, no missed banners.** Earlier 3.5.x builds silently dropped the toast on real Claude Code sessions because the PowerShell child that registers the toast was getting killed inside Claude Code's hook job-object before reaching `ToastNotificationManager.Show()`. The toast spawn now uses a proven `cmd /c start "" /B wscript.exe hide.vbs powershell.exe …` chain. `start /B` escapes Claude's job so PowerShell survives, while `wscript hide.vbs` launches PowerShell at `intWindowStyle=0` so no console window is ever allocated. **No more "desktop refresh" / PS console flash** before each notification, and no missed toasts.
-- **Notification sound plays every time.** Same root cause and same fix as the toast: the sound subprocess was being killed inside Claude's job. Wrapped in the same chain, sound now fires reliably with no flash.
-- **Clicking the toast actually focuses the right terminal again.** 3.4.0 had switched the toast launch URI to a custom `claude-notif://` scheme to skirt VS Code's "external application wants to open" prompt, but Windows' toast click-activation pipeline silently dropped custom schemes for our AUMID. The toast now uses `vscode://dimokol.claude-notifications/click?marker=...`, which Windows routes through VS Code to our extension's registered `UriHandler`. The click event is processed in-process, no file mediation, no race. Multi-session-in-same-workspace disambiguation works via PID/AI-title tiers on the marker payload. (You'll see VS Code's "external application wants to open?" prompt on the first banner click after upgrade, click "Open" and tick "Do not ask me again for this extension" to make it permanently silent.)
-- **No more duplicate hook entries on Windows.** A path-quoting bug used to append a fresh hook entry to `~/.claude/settings.json` on every VS Code restart (one tester reached 12 entries per event). Fixed in place, with auto-migration: install v3.5.5 over a buggy older install and the 12 duplicates collapse to 1 on first activation. Plus an idempotency regression test so it can't come back.
-- **Banner click jumps to the correct terminal tab.** Clicking a Windows toast routes through VS Code to the originating session and focuses the right terminal. Note: bringing the VS Code *window* to the foreground on click is a known Windows limitation (the OS shields the notification surface from background focus changes), so the taskbar flashes instead, and with several VS Code windows open that flash can land on the active window rather than the one that fired. See `docs/windows-banner-focus-handoff.md` for the full investigation.
-- **Clicking a notification opens your actual VS Code build, including Insiders.** Windows sends `vscode://` links to whichever build owns the scheme (usually Stable), so Insiders users used to get a fresh Stable window instead of the Insiders window the notification came from. The toast now detects which build your Claude session is running in (Stable, Insiders, or forks like VSCodium, Cursor, Windsurf) and opens the matching scheme (`vscode-insiders://`, and so on), so the click lands in the right instance. Thanks **[@mlidbom](https://github.com/mlidbom)** for filing [#4](https://github.com/dimokol/claude-notifications/issues/4) with the suggestion.
-- **No PowerShell console window flash.** Several spawn paths used to allocate a brief console window before `-WindowStyle Hidden` took effect. Every PS spawn now either runs through `wscript hide.vbs` or uses `windowsHide: true`, so no flash on notification, sound, or click.
+- **Fixed a window where notifications vanished entirely.** A new question or completion landing 3 to 5 seconds after the previous notification was silently dropped by the claim layer (the dedup approved it, the claim marker suppressed it). Answer a question fast and the next one could arrive mute. Claim markers now carry the attention point's identity, so a genuinely new event always gets through.
+- **Questions notify even if Claude Code changes its events.** Multi-choice `AskUserQuestion` prompts used to depend entirely on the `PermissionRequest` hook, which upstream doesn't guarantee for questions. A second, documented channel (`PreToolUse` scoped to `AskUserQuestion`) now announces every question redundantly; the dedup collapses the pair, so still exactly one alert.
+- **Banners show the actual question.** `Question in api-server: Which auth method should we use?` instead of a generic "Waiting for your response".
+- **Your terminal names in notifications.** Renamed a terminal tab to `deploy-bot`? Banners and toasts for that session now say `deploy-bot` instead of the AI-generated session title. No setup needed: rename the tab and the next notification picks it up.
+- **Extension updates can no longer kill your hooks mid-session.** If a Claude hook fired while VS Code was swapping extension versions, the wrapper mistook the update for an uninstall and stripped every profile's hooks. It now re-points itself at the newest installed version and only self-destructs on a true uninstall.
+- **Smarter handling of Claude Code's notification types.** Status-only events (`auth_success`, elicitation results) no longer fire bogus "waiting" banners; background-agent events (`agent_needs_input` / `agent_completed`, Claude Code ≥2.1.198) now notify properly instead of being suppressed as re-fires.
+- **macOS fixes:** `terminal-notifier` is found even when VS Code was launched from the Dock (Homebrew not on PATH); alerts remain clickable for 1 hour instead of 5 minutes; apostrophes in session titles no longer break the fallback banner.
+- **Housekeeping:** stale per-workspace state dirs are garbage-collected after 30 days, `Test Notification` works without `node` on PATH, and torn signal-file reads can't fire garbage notifications anymore.
 
-### Reliability everywhere
-- **No more `MODULE_NOT_FOUND` errors after the extension updates or uninstalls.** Hooks now point at a stable wrapper under `~/.claude/claude-notifications/` instead of the versioned extension dir. When the extension is gone, the wrapper detects this on its next fire and self-cleans every Claude profile (default and `.claude-*` siblings), the Windows registry handler, the launcher dir, and the per-workspace state, no leftover trash. Thanks **[@iodar](https://github.com/iodar)** for filing [#1](https://github.com/dimokol/claude-notifications/issues/1) with a precise root-cause and the exact wrapper-script suggestion.
-- **"Uninstall" cleans every Claude profile, not just the default.** Multi-profile users (`.claude-work`, `.claude-other`, …) used to be left with dangling hook entries pointing at the deleted wrapper. Both the Uninstall command and "Remove Hooks" now iterate every discovered profile and clean them all.
-- **No more Stop-hook hang on Windows.** Sound playback used to keep Node's event loop alive on Windows for several seconds (sometimes minutes if a latent PowerShell `NaturalDuration` polling loop tripped). All three sound spawns are now detached + unref'd, with an explicit watchdog. Thanks **[@valdiks](https://github.com/valdiks)** for filing [#2](https://github.com/dimokol/claude-notifications/issues/2) with the diagnosis and the exact fix.
-- **Turns finish instantly: no more "running Stop hook" pause.** On top of the detached-sound fix, hooks now install with `async: true`, so Claude fires them and continues immediately instead of waiting ~1.2s for the notification handshake to complete. The notification still fires (a beat after the turn completes); the wait is just gone. Older Claude Code builds that don't recognize the flag behave exactly as before.
+> **Heads-up for Claude Code 2.1.198 and 2.1.199 (Jul 1 and 2, 2026):** those builds auto-answered multi-choice questions after 60 seconds of idle by default (reverted to opt-in in 2.1.200). If questions seemed to "answer themselves" or notifications seemed missed while away, update Claude Code to 2.1.200 or newer; that was upstream, not the notifications.
 
-### Better terminal matching + notification dedup
-- **Right terminal focused on Git Bash + Windows.** Tiered terminal matching (PID → shell-integration cwd → Claude title markers → AI-generated session title → single non-default-shell-named) replaces the previous PID-only match that silently broke under MSYS2 / winpty / ConPTY indirection. Multi-session-in-one-workspace setups also disambiguate via the unique AI-generated task title each Claude session writes to its terminal.
-- **Exactly one notification per attention point: no duplicates, no late repeats.** You get a single alert each time Claude finishes, asks a question, or needs permission, and never miss one. Previously a completion could fire twice (a second alert seconds later) and sometimes a third a minute or two on, because Claude re-emits "still waiting" reminders for the same moment. The dedup now treats those reminders as what they are (trailers) and collapses them, while still firing once for every genuinely new event, including back-to-back multi-choice `AskUserQuestion`s, which each fire their own request. Fast banner-clicks no longer double-sound either.
-- **Session title in notifications.** Banners and toasts include Claude Code's auto-generated session title: `Task completed in: my-project — Refactor the auth middleware`.
-
-### New
-- **`claudeNotifications.toastWhenFocused`** (default `false`). Opt-in visual toast when you're already on the Claude terminal, useful for multi-monitor or small-terminal-panel setups where the audio cue alone can be missed. The companion `soundWhenFocused` setting continues to control audio independently.
-
-Massive thanks to **[@AdaWanheda](https://github.com/AdaWanheda)** for thorough Windows testing across PowerShell, Git Bash, and multi-monitor setups, and to the 2026-05-23 live-test session that surfaced the toast/sound/click regressions caught and fixed in 3.5.5.
-
-See [CHANGELOG.md](CHANGELOG.md) for the full history.
+See [CHANGELOG.md](CHANGELOG.md) for the full history, including the v3.5.5 Windows reliability overhaul.
 
 ## How It Works
 
 ```
-Claude fires hook (Stop / Notification / PermissionRequest / UserPromptSubmit)
+Claude fires hook (Stop / Notification / PermissionRequest / PreToolUse[AskUserQuestion] / UserPromptSubmit)
        │
        ▼
 hook.js consults stage-dedup state for this session
@@ -174,13 +162,19 @@ Open the command palette (`Ctrl/Cmd+Shift+P`) and search for:
 
 ## Monitored Events
 
-The extension listens to three Claude Code hook events, grouped into two types:
+The extension listens to four Claude Code hook events, grouped into two types:
 
 | Type | Hook events | Banner text | Bundled sound |
 |---|---|---|---|
-| **Waiting** | `Notification`, `PermissionRequest` | "Waiting for your response in: *{project}*" | `notification.wav` |
+| **Waiting** | `Notification`, `PermissionRequest`, `PreToolUse` (scoped to `AskUserQuestion` only) | "Waiting for your response in: *{project}*", or "Question in *{project}*: *{question}*" for multi-choice questions | `notification.wav` |
 | **Completed** | `Stop` | "Task completed in: *{project}*" | `task-complete.wav` |
 | *(stage advance)* | `UserPromptSubmit` | none (bumps stageId so the next event re-notifies) | n/a |
+
+`Notification` events are filtered by their `notification_type`: status-only types (`auth_success`, elicitation results) are ignored, background-agent types (`agent_needs_input` / `agent_completed`) notify as their own attention points, and the generic `permission_prompt` / `idle_prompt` reminders are collapsed into the primary event that already notified.
+
+### Custom terminal names
+
+Rename a terminal tab (right-click the tab → **Rename**, or `Terminal: Rename` in the command palette) and notifications for the Claude session in that terminal use your name as the identity line instead of the AI-generated session title, on OS banners and in-window toasts alike. Stock shell names and Claude's own titles don't count as custom, so nothing changes until you actually rename. If the name can't be resolved (for example Windows + Git Bash, where the shell PID is masked), notifications fall back to the AI title.
 
 ## macOS Setup
 
@@ -211,20 +205,21 @@ If you previously used the shell-script setup:
 | No notifications at all | Run **"Test Notification"** from the command palette. Check the status bar isn't showing `Muted`. |
 | No sound | Check that `waiting.action` / `completed.action` aren't set to `Notification only` or `Nothing`, and that `volume` is > 0. |
 | Sound is too loud or too quiet | Adjust `volume`. `50` matches typical OS-notification loudness; `100` plays the file at its native level. OS master volume still applies. |
-| Notification doesn't open VS Code | macOS: run **"Configure macOS terminal-notifier"**. Windows: the extension auto-registers a `claude-notif://` URI handler under `HKCU\Software\Classes\` on activation, no setup needed. If clicks do nothing, check the **"Claude Notifications"** Output panel for `Windows click-handler registered:`. |
+| Notification doesn't open VS Code | macOS: run **"Configure macOS terminal-notifier"**. Windows: the toast click routes through a `vscode://dimokol.claude-notifications/…` URI to the extension's URI handler. On the first click VS Code asks "an external application wants to open"; choose **Open** and tick "Do not ask again for this extension". If clicks do nothing after that, check the **"Claude Notifications"** Output panel for `Click-to-focus [uri]` lines. |
 | Want to fully uninstall | Just uninstall the extension from the VS Code Extensions view. The next Claude message after uninstall auto-cleans every artefact: hook entries from every Claude profile's `settings.json`, the per-workspace state in `~/.claude/focus-state/`, the wrapper dir at `~/.claude/claude-notifications/`, and (on Windows) the `claude-notif://` registry key plus the launcher in `%LOCALAPPDATA%\claude-notifications\`. The **"Claude Notifications: Uninstall"** palette command does the same thing eagerly if you want everything gone immediately. |
 | Duplicate notifications | Update to v3.2+. The new stage-ID dedup suppresses re-fires of the same event until you acknowledge. See [How It Works](#how-it-works). If still duplicating, make sure the legacy `dimokol.claude-terminal-focus` extension is uninstalled. |
 | Notifications stop firing | Inspect `~/.claude/focus-state/<hash>/sessions` (where `<hash>` is the 12-char hash for your workspace). If you see `resolved:true` stuck for the active session, that's the dedup remembering you acknowledged a stage. Delete the file to reset; the next event will create a fresh stage. |
 | Two `terminal-notifier` entries in macOS Notifications | macOS keeps notification settings per bundle, and a past install (e.g. bundled with `node-notifier` or an older brew version) can linger. Configure the entry you want and leave the other off. To fully reset: `killall NotificationCenter` then fire any notification once to re-register. |
 | Wrong terminal focused | Check the **"Claude Notifications"** Output panel for PID matching logs. |
 | Hooks not firing | Run **"Set Up Claude Code Hooks"** and restart any active Claude Code sessions so they re-read `~/.claude/settings.json`. |
+| Multi-choice questions answer themselves / seem to skip notification | Claude Code 2.1.198 and 2.1.199 auto-answered `AskUserQuestion` after 60s idle by default (opt-in since 2.1.200). Update Claude Code. |
 | Extension not activating | Check the **"Claude Notifications"** channel in the Output panel. |
 
 ## How the Hook Works
 
 The extension ships two bundled hooks that Claude Code invokes:
 
-- `dist/hook.js`: runs on `Stop`, `Notification`, and `PermissionRequest`. Decides whether to notify, writes the signal, and races the extension for the claim.
+- `dist/hook.js`: runs on `Stop`, `Notification`, `PermissionRequest`, and `PreToolUse` (matcher-scoped to `AskUserQuestion`). Decides whether to notify, writes the signal, and races the extension for the claim.
 - `dist/hook-user-prompt.js`: runs on `UserPromptSubmit`. Tiny: it just advances the session's `stageId` so the next Stop/Notification is treated as a fresh stage.
 
 `hook.js` flow:
@@ -239,13 +234,14 @@ The extension ships two bundled hooks that Claude Code invokes:
 8. Atomically tries to claim the handled-marker (`O_EXCL`). If the extension or a sibling hook already claimed it, exits silently.
 9. Otherwise marks the signal `fired`, plays the configured sound, and shows an OS banner.
 
-A stage is marked **resolved** when:
+A stage is marked **resolved** only on an explicit click:
 
 - You click an OS banner (`terminal-notifier -execute` writes a clicked marker; the extension picks it up and marks resolved).
 - You click **Focus Terminal** on an in-window toast.
-- The notification fires while you're already focused on the matching terminal (sound-only path).
 
-After `markResolved`, the next event of any type (even the same type) advances the stageId and notifies again.
+The sound-only path (notification fires while you're already on the matching terminal) deliberately does **not** resolve the stage, because doing so re-opened the dedup gate and double-sounded the trailing platform event (fixed in v3.3.1).
+
+After a resolve, the next *primary* event (a `Stop`, `PermissionRequest`, or question `PreToolUse` arriving after the burst window) starts a fresh stage and notifies again; bare `Notification` re-fires stay collapsed.
 
 `hook.js`, `hook-user-prompt.js`, and the extension are all bundled with esbuild, so the installed package has no runtime `node_modules` dependency, just self-contained JS files.
 

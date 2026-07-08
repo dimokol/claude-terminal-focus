@@ -133,6 +133,48 @@ function selfDestruct({ home = os.homedir(), wrapperDir = __dirname } = {}) {
     }
   }
 }
+function compareVersions(a, b) {
+  const pa = String(a).split(".");
+  const pb = String(b).split(".");
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const na = parseInt(pa[i], 10) || 0;
+    const nb = parseInt(pb[i], 10) || 0;
+    if (na !== nb) return na - nb;
+  }
+  return 0;
+}
+function findNewestExtensionHook(recordedPath, isUserPrompt, fsLike = fs) {
+  if (typeof recordedPath !== "string" || recordedPath === "") return null;
+  try {
+    const extRoot = path.dirname(path.dirname(path.dirname(recordedPath)));
+    const prefix = "dimokol.claude-notifications-";
+    const file = isUserPrompt ? "hook-user-prompt.js" : "hook.js";
+    let entries;
+    try {
+      entries = fsLike.readdirSync(extRoot, { withFileTypes: true });
+    } catch (_) {
+      return null;
+    }
+    const candidates = [];
+    for (const e of entries) {
+      if (!e.isDirectory() || !e.name.startsWith(prefix)) continue;
+      const hookPath = path.join(extRoot, e.name, "dist", file);
+      let exists = false;
+      try {
+        fsLike.accessSync(hookPath);
+        exists = true;
+      } catch (_) {
+      }
+      if (exists) candidates.push({ version: e.name.slice(prefix.length), hookPath, dir: path.join(extRoot, e.name) });
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => compareVersions(b.version, a.version));
+    return candidates[0];
+  } catch (_) {
+    return null;
+  }
+}
 function main() {
   const stateFile = path.join(__dirname, "state.json");
   const isUserPrompt = path.basename(__filename) === "hook-user-prompt.cjs";
@@ -142,13 +184,26 @@ function main() {
   } catch (_) {
     process.exit(0);
   }
-  const target = isUserPrompt ? state.extensionUserPromptHookPath : state.extensionHookPath;
+  let target = isUserPrompt ? state.extensionUserPromptHookPath : state.extensionHookPath;
   if (!target || !pathExistsSync(target)) {
-    try {
-      selfDestruct();
-    } catch (_) {
+    const recorded = state.extensionHookPath || state.extensionUserPromptHookPath || "";
+    const newest = findNewestExtensionHook(recorded, isUserPrompt);
+    if (newest) {
+      target = newest.hookPath;
+      try {
+        state.extensionHookPath = path.join(newest.dir, "dist", "hook.js");
+        state.extensionUserPromptHookPath = path.join(newest.dir, "dist", "hook-user-prompt.js");
+        state.extensionVersion = newest.version;
+        fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+      } catch (_) {
+      }
+    } else {
+      try {
+        selfDestruct();
+      } catch (_) {
+      }
+      process.exit(0);
     }
-    process.exit(0);
   }
   try {
     require(target);
@@ -172,6 +227,8 @@ module.exports = {
   discoverProfiles,
   stripFromSettings,
   selfDestruct,
+  compareVersions,
+  findNewestExtensionHook,
   SELF_IDENTIFIERS,
   main
 };
