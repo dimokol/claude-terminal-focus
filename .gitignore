@@ -6,3 +6,4 @@ docs/
 .vscode/.claude-focus-sessions
 .DS_Store
 .claude/
+prompt.md

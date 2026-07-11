@@ -52,7 +52,7 @@ repo root
 │
 ├── test/                     # node:test unit tests for state-paths and stage-dedup. Run with `npm test`.
 ├── docs/
-│   ├── publish-checklist.md          # Pre-publish checklist. Always run through it before vsce publish.
+│   ├── publish-checklist.md          # Pointer only — the canonical checklist is in this file (see below).
 │   ├── superpowers/plans/             # Implementation plans for non-trivial work.
 │   └── claude-notifications.md        # Older design doc.
 ├── sounds/                   # Bundled .wav files (notification.wav, task-complete.wav).
@@ -186,7 +186,7 @@ If you forget step 3, you'll edit `hook.js`, rebuild, and wonder why nothing cha
 
 ## Pre-publish checklist (canonical)
 
-Always run through this before `vsce publish` (or `vsce package` for a manual VSIX). Mirrors `docs/publish-checklist.md` with v3.2.0 additions.
+Always run through this before `vsce publish` (or `vsce package` for a manual VSIX). This section is the single source of truth (`docs/publish-checklist.md` is just a pointer here).
 
 - [ ] **`version` bumped** in `package.json` (semver: patch for fixes, minor for additions, major for breaking changes to the user contract — settings, command names, hook behavior).
 - [ ] **`CHANGELOG.md` updated** with a section for the new version (Changed / Added / Removed / Fixed). Date in `YYYY-MM-DD`.
@@ -225,7 +225,7 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 - **Don't mutate `.vscode/` in user workspaces.** All ephemeral state lives under `~/.claude/focus-state/<hash>/`. The only `.vscode/` interaction is the workspace-root walk that uses `.vscode/` as a heuristic marker.
 - **Conventional Commits.** Commit messages: `feat:` / `fix:` / `chore:` / `docs:` / `refactor:` / `build:` / `test:`. Optional scope in parens. Used by humans, not automation, so don't optimize for tooling.
 - **Comments**: only when the *why* is non-obvious. The codebase has plenty of "// keep readable for stack traces" / "// O_EXCL atomic" / "// 0–100 → amplitude (NOT 0–255)" — those rescue future debuggers from rediscovering past bugs. Don't add narration of *what* the code does.
-- **Plans and docs.** Non-trivial work goes through a written plan in `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`. The most recent: `docs/superpowers/plans/2026-04-24-v3.2.0-stage-dedup.md`.
+- **Plans and docs.** Non-trivial work goes through a written plan in `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`. Find the current one by date prefix (`ls docs/superpowers/plans/`) — don't trust a hardcoded "most recent" pointer here, it goes stale.
 
 ---
 
