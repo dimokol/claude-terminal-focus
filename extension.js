@@ -1,4 +1,4 @@
-// extension.js — Claude Notifications v3.1.3
+// extension.js — Claude Notifications VS Code extension
 // hook.js handles OS banner + sound as a fallback (runs outside VS Code).
 // This extension handles: atomic claim-based dedup, terminal focusing,
 // status bar, settings sync, and commands.
@@ -30,6 +30,7 @@ const { matchTerminal } = require('./lib/terminal-match');
 const { isCustomTerminalName, writeTerminalNamesCache, NAME_CACHE_HEARTBEAT_MS } = require('./lib/terminal-names');
 const { checkHookStatus, checkAllProfiles, installHooks, uninstallHooks, discoverProfiles } = require('./lib/hooks-installer');
 const { installHookRuntime, uninstallHookRuntime, getWrapperHookPath, getWrapperUserPromptPath } = require('./lib/hook-runtime');
+const { resolveMacCodeCli, writeEditorHost } = require('./lib/mac-code-cli');
 
 let _wrapperPaths = null;
 function getWrapperPaths() {
@@ -206,6 +207,9 @@ vscode.commands.registerCommand('claudeNotifications.testNotification', () => cm
         syncSettingsToConfig(context.extensionPath, log);
         updateStatusBar(statusBarItem, context.extensionPath);
       }
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      syncSettingsToConfig(context.extensionPath, log);
     })
   );
 
@@ -553,7 +557,7 @@ async function handleClickedSignal(workspaceRoot, log) {
     target = { ...clickPayload, source: 'marker' };
   } else {
     if (clickPayload && clickPayload.stale) {
-      log.appendLine('Click marker is stale (>5min) — falling back to signal file');
+      log.appendLine('Click marker is stale (>1h) — falling back to signal file');
     } else if (clickPayload && clickPayload.legacy) {
       log.appendLine('Click marker has legacy empty payload — falling back to signal file');
     }
@@ -760,14 +764,21 @@ function readConfig() {
 }
 
 function writeConfig(config) {
+  let tmpPath = '';
   try {
     const configPath = getConfigPath();
     const claudeDir = path.dirname(configPath);
     if (!fs.existsSync(claudeDir)) {
       fs.mkdirSync(claudeDir, { recursive: true });
     }
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  } catch (_) {}
+    tmpPath = `${configPath}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+    fs.renameSync(tmpPath, configPath);
+  } catch (_) {
+    if (tmpPath) {
+      try { fs.unlinkSync(tmpPath); } catch (_) {}
+    }
+  }
 }
 
 function updateStatusBar(item, extensionPath) {
@@ -1241,6 +1252,33 @@ function syncSettingsToConfig(extensionPath, log) {
   // click time to decide between Win32 HWND focusing ("hwnd", default) and
   // the legacy `code <workspace>` CLI routing ("cli"). See README.
   config.windowsClickBehavior = cfg.get('windows.clickBehavior', 'hwnd');
+
+  // macOS banner clicks happen in hook.js, outside the editor process. Resolve
+  // the launcher while the VS Code API can tell us which product is hosting
+  // the extension, then persist it for the hook. Each workspace gets its own
+  // record so VS Code + VSCodium/Cursor/Windsurf running at the same time do
+  // not fight over the single shared config file.
+  if (process.platform === 'darwin') {
+    const macHost = resolveMacCodeCli({
+      overridePath: cfg.get('macOS.codeCliPath', ''),
+      appRoot: vscode.env.appRoot || '',
+      uriScheme: vscode.env.uriScheme || '',
+      execPath: process.execPath
+    });
+    if (macHost) {
+      config.macOS = macHost;
+      const folders = vscode.workspace.workspaceFolders || [];
+      for (const folder of folders) {
+        if (!writeEditorHost(folder.uri.fsPath, macHost)) {
+          log.appendLine(`Could not persist macOS editor host for ${folder.uri.fsPath}`);
+        }
+      }
+      log.appendLine(`macOS editor CLI: ${macHost.codeCliPath} (${macHost.source}, scheme=${macHost.uriScheme || 'unknown'})`);
+    } else {
+      delete config.macOS;
+      log.appendLine('macOS editor CLI could not be resolved; banner clicks will use the legacy code lookup');
+    }
+  }
 
   writeConfig(config);
   log.appendLine('Settings synced to shared config');

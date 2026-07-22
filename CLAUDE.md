@@ -2,7 +2,7 @@
 
 > Project: **Claude Notifications** — VS Code extension (publisher `dimokol`, id `dimokol.claude-notifications`).
 > Repo name on disk: `claude-terminal-focus` (legacy directory name; do not rename, the publisher id is what users see).
-> Current version: **3.6.0**.
+> Current version: **3.7.0**.
 > User: solo maintainer, dev machine is macOS, target users are Claude Code users on macOS / Windows / Linux.
 
 This file is the entry point for any Claude / AI coding agent working in this repo. Read it before touching code or doing release work.
@@ -35,6 +35,7 @@ repo root
 ├── lib/
 │   ├── signals.js            # Signal-file parsing + atomic claim marker (`O_EXCL`, sessionId:stageId tags).
 │   ├── state-paths.js        # ~/.claude/focus-state/<sha1(workspace).slice(0,12)>/ path derivation (lazy root for test sandboxing).
+│   ├── mac-code-cli.js       # Resolve the current macOS editor's CLI and persist per-workspace host metadata for banner clicks.
 │   ├── hook-input.js         # Pure hook-stdin classification: notification_type semantics + AskUserQuestion question extraction.
 │   ├── terminal-names.js     # User-renamed-tab detection + pid→name cache (extension writes, hook.js reads for banner labels).
 │   ├── stage-dedup.js        # Stage-ID state machine (shouldNotify, advanceOnPrompt, markResolved).
@@ -74,6 +75,8 @@ repo root
   terminal-names  # JSON { updatedAt, names: { pid: terminalName } } — written by the extension's poll
                   #   (on change + 60s heartbeat); hook.js reads it to put user-renamed tab names on
                   #   OS banners. Stale after 5 min (VS Code closed → expires).
+  editor-host     # JSON { codeCliPath, cliName, uriScheme, updatedAt } — macOS editor launcher
+                  #   resolved from vscode.env and used when a banner click raises the workspace.
 ```
 
 This location is **outside** any workspace's `.vscode/` directory and therefore can never appear in `git status`. Do not move it back inside the workspace.
@@ -236,6 +239,9 @@ Always run through this before `vsce publish` (or `vsce package` for a manual VS
 - **Linux has no click-to-focus.** `notify-send` banners carry no action; clicking does nothing. Sound + banner only.
 - **Remote/WSL/SSH is untested.** The extension likely runs on the remote host (no `extensionKind` declared); in-window toasts should work, OS banners/sounds run on the remote side and may be silent on headless hosts. WSLg setups reportedly show notify-send banners.
 - **No automated UI tests.** `extension.js` is exercised manually. The `vscode-test` harness is heavy and the manual checklist has been good enough so far.
+- **Notification preferences are globally last-writer-wins.** Every editor window syncs its effective settings into one `~/.claude/claude-notifications-config.json`. If two workspaces deliberately use different workspace-scoped sound/action settings, the most recently activated or changed window controls hook behavior for both. The macOS editor launcher is protected by a per-workspace `editor-host` record, but sounds/actions are not yet per-workspace.
+- **macOS notification groups can collide.** `terminal-notifier -group` currently uses only the project basename. Its group contract replaces the previous notification with the same ID, so simultaneous sessions in one project (or same-named projects in different directories) can hide an earlier still-actionable alert. Make the group workspace/session-aware when this is addressed.
+- **Two editor products on the exact same workspace remain ambiguous on macOS.** The per-workspace `editor-host` record is last-writer-wins if, for example, VS Code and VSCodium both have the same folder open at once. Different products on different workspaces are isolated correctly. Fully solving the same-workspace case needs host records keyed by terminal/process ownership.
 - **Workspace root heuristic.** `hook.js` walks up looking for a `.vscode/` directory. If the user runs Claude from a deeply nested subdirectory of a non-VS-Code repo, they get an isolated state dir per `claude` invocation. Acceptable.
 - **`extensionPack` is softer than `extensionDependencies` was, but still tied to the upstream ID.** If `anthropic.claude-code` is renamed or unpublished, the install-time bundle breaks (our extension still installs fine). See the publish checklist.
 

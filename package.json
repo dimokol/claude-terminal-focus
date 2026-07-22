@@ -2,7 +2,7 @@
   "name": "claude-notifications",
   "displayName": "Claude Notifications",
   "description": "All-in-one Claude Code notifications — sound alerts, OS notifications, and terminal focus. One-click setup, zero external dependencies.",
-  "version": "3.6.0",
+  "version": "3.7.0",
   "publisher": "dimokol",
   "license": "MIT",
   "repository": {
@@ -223,6 +223,13 @@
           "type": "null",
           "order": 100,
           "markdownDescription": "macOS only. [Configure terminal-notifier](command:claudeNotifications.setupMacNotifier) for click-to-open banners."
+        },
+        "claudeNotifications.macOS.codeCliPath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "order": 101,
+          "markdownDescription": "macOS only. Optional path to this editor product's CLI launcher (for example `/Applications/VSCodium.app/Contents/Resources/app/bin/codium`). Normally detected automatically; set this only for portable, renamed, or unusual installations. Use an absolute path or one starting with `~`."
         },
         "claudeNotifications.windows.clickBehavior": {
           "type": "string",

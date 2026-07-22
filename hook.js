@@ -36,6 +36,7 @@ const { snapshot: processSnapshot, walkUp } = require('./lib/process-tree');
 const { schemeForBinaryName, classifyBuild } = require('./lib/code-build');
 const { classifyHookInput, extractQuestionText } = require('./lib/hook-input');
 const { readTerminalNamesCache, lookupCustomName } = require('./lib/terminal-names');
+const { isExecutable, normalizeEditorHost, readEditorHost, safeCliName } = require('./lib/mac-code-cli');
 
 // Process names we consider "the interactive shell hosting Claude". The
 // first ancestor matching one of these is recorded as signal.shellPid —
@@ -467,20 +468,23 @@ function xmlEsc(s) {
   // Show OS notification
   if (!shouldNotify) process.exit(0);
 
-  function findCodeCli() {
-    const candidates = ['/usr/local/bin/code', '/opt/homebrew/bin/code'];
-    for (const c of candidates) {
-      if (fs.existsSync(c)) return c;
+  function findCodeCli(host) {
+    if (host) {
+      if (isExecutable(host.codeCliPath)) return host.codeCliPath;
+      const cliName = safeCliName(host.cliName);
+      if (cliName) return findMacBinary(cliName);
+      // Metadata exists, so falling back to a different product's `code`
+      // launcher could raise the wrong app. A marker-only click is safer.
+      return null;
     }
-    try {
-      return execSync('which code', { encoding: 'utf8', timeout: 2000 }).trim();
-    } catch (_) {
-      return 'code';
-    }
+    // Backward compatibility for hooks fired before the extension has written
+    // host metadata (for example immediately after upgrading from 3.6.0).
+    return findMacBinary('code') || 'code';
   }
 
   if (process.platform === 'darwin') {
-    const codeCli = findCodeCli();
+    const macHost = readEditorHost(workspaceRoot) || normalizeEditorHost(config.macOS);
+    const codeCli = findCodeCli(macHost);
     // Probe absolute Homebrew/MacPorts paths first — the hook's PATH often
     // lacks them (VS Code launched from the Dock), and missing the binary
     // here silently downgraded banners to the click-less osascript path.
@@ -497,7 +501,14 @@ function xmlEsc(s) {
         sessionId, pids, shellPid, workspaceRoot, projectDir,
         event: hookEvent, project: projectName, aiTitle
       });
-      const executeCmd = `/usr/bin/printf '%s' ${shEsc(clickPayload)} > ${shEsc(clickedPath)} && ${shEsc(codeCli)} ${shEsc(workspaceRoot)}`;
+      // Publish the marker by rename so the extension's 400ms poll cannot
+      // mistake a partial JSON write for a legacy/corrupt marker and focus a
+      // sibling session via the shared signal-file fallback.
+      const clickedTmpPath = `${clickedPath}.tmp.${process.pid}.${Date.now()}`;
+      const writeClickMarker = `/usr/bin/printf '%s' ${shEsc(clickPayload)} > ${shEsc(clickedTmpPath)} && /bin/mv -f ${shEsc(clickedTmpPath)} ${shEsc(clickedPath)}`;
+      const executeCmd = codeCli
+        ? `${writeClickMarker} && ${shEsc(codeCli)} ${shEsc(workspaceRoot)}`
+        : writeClickMarker;
       const notifierArgs = [
         '-title', eventInfo.title,
         '-message', eventInfo.message,

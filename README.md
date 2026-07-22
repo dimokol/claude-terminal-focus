@@ -10,7 +10,7 @@ When running multiple Claude Code sessions across different VS Code windows and 
 
 1. **Hear a sound** when Claude finishes a task or needs your input.
 2. **See an OS banner** showing which project needs attention, even when VS Code is not in focus.
-3. **Click the banner** to jump directly to the correct VS Code window and terminal tab.
+3. **Click the banner** on macOS or Windows to jump to the correct editor window and terminal tab. (Linux currently provides sound + banner only.)
 
 Works on **macOS**, **Windows**, and **Linux**, across multiple VS Code windows and terminals simultaneously.
 
@@ -25,20 +25,10 @@ Works on **macOS**, **Windows**, and **Linux**, across multiple VS Code windows 
 
    If you ever need to re-run setup: `Ctrl/Cmd+Shift+P` → **"Claude Notifications: Set Up Claude Code Hooks"**.
 
-## What's New in v3.6.0
+## What's New in v3.7.0
 
-A reliability release focused on the "never zero, never two" notification guarantee.
-
-- **Fixed a window where notifications vanished entirely.** A new question or completion landing 3 to 5 seconds after the previous notification was silently dropped by the claim layer (the dedup approved it, the claim marker suppressed it). Answer a question fast and the next one could arrive mute. Claim markers now carry the attention point's identity, so a genuinely new event always gets through.
-- **Questions notify even if Claude Code changes its events.** Multi-choice `AskUserQuestion` prompts used to depend entirely on the `PermissionRequest` hook, which upstream doesn't guarantee for questions. A second, documented channel (`PreToolUse` scoped to `AskUserQuestion`) now announces every question redundantly; the dedup collapses the pair, so still exactly one alert.
-- **Banners show the actual question.** `Question in api-server: Which auth method should we use?` instead of a generic "Waiting for your response".
-- **Your terminal names in notifications.** Renamed a terminal tab to `deploy-bot`? Banners and toasts for that session now say `deploy-bot` instead of the AI-generated session title. No setup needed: rename the tab and the next notification picks it up.
-- **Extension updates can no longer kill your hooks mid-session.** If a Claude hook fired while VS Code was swapping extension versions, the wrapper mistook the update for an uninstall and stripped every profile's hooks. It now re-points itself at the newest installed version and only self-destructs on a true uninstall.
-- **Smarter handling of Claude Code's notification types.** Status-only events (`auth_success`, elicitation results) no longer fire bogus "waiting" banners; background-agent events (`agent_needs_input` / `agent_completed`, Claude Code ≥2.1.198) now notify properly instead of being suppressed as re-fires.
-- **macOS fixes:** `terminal-notifier` is found even when VS Code was launched from the Dock (Homebrew not on PATH); alerts remain clickable for 1 hour instead of 5 minutes; apostrophes in session titles no longer break the fallback banner.
-- **Housekeeping:** stale per-workspace state dirs are garbage-collected after 30 days, `Test Notification` works without `node` on PATH, and torn signal-file reads can't fire garbage notifications anymore.
-
-> **Heads-up for Claude Code 2.1.198 and 2.1.199 (Jul 1 and 2, 2026):** those builds auto-answered multi-choice questions after 60 seconds of idle by default (reverted to opt-in in 2.1.200). If questions seemed to "answer themselves" or notifications seemed missed while away, update Claude Code to 2.1.200 or newer; that was upstream, not the notifications.
+- **macOS banner clicks open the editor they came from.** Clicking a VSCodium, Cursor, Windsurf, VS Code Insiders, or other Code OSS notification now raises that editor and workspace instead of doing nothing or opening VS Code Stable. The right launcher is detected automatically. Thanks **[@jmuheim](https://github.com/jmuheim)** for filing [#5](https://github.com/dimokol/claude-notifications/issues/5) with the precise diagnosis and suggested fix.
+- **Unusual macOS installs have an escape hatch.** If automatic detection cannot find your editor's CLI, point `claudeNotifications.macOS.codeCliPath` at it explicitly.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history, including the v3.5.5 Windows reliability overhaul.
 
@@ -58,7 +48,7 @@ hook.js consults stage-dedup state for this session
        Write signal file → sleep 1.2 s → race the extension
              │
              ├── Extension wins the claim (VS Code is focused):
-             │     ├─ Already on the correct terminal → sound only (and ack)
+             │     ├─ Already on the correct terminal → sound only
              │     └─ Different terminal / tab        → sound + in-window toast
              │
              └── Hook wins the claim (VS Code not focused / closed):
@@ -77,6 +67,8 @@ The extension **never changes terminal focus without an explicit user action**:
 You will never lose your place in a terminal because of a notification.
 
 > **Windows note: clicking the banner flashes the taskbar instead of raising the window.** On Windows, clicking an OS banner reliably **switches to the correct terminal in the correct window**, but it currently can't pull the VS Code **window** itself to the front over another app. Windows flashes the taskbar button and you click it to come up (already on the right terminal). This is the same behavior as Slack/Discord/Teams toast clicks.
+
+> **Linux note: OS banners are not clickable yet.** The current `notify-send` fallback provides sound + banner only. In-window **Focus Terminal** actions still work when the editor is focused.
 
 ## Help wanted: Windows banner-click window focus
 
@@ -131,6 +123,7 @@ Fires when Claude finishes a task (Stop).
 |---|---|---|
 | `soundWhenFocused` | `sound` | What to do when you're already on the terminal Claude just wrote to: `sound` (play audio cue) or `nothing` (stay silent). |
 | `macOS.setup` | n/a | macOS only. Link to the Configure command that detects whether `terminal-notifier` is installed and offers install / reinstall / test / open Notification Settings. |
+| `macOS.codeCliPath` | *(auto-detect)* | macOS only. Optional path to this editor's CLI for portable, renamed, or unusual installs. Use an absolute path or one starting with `~`. |
 
 #### Picking a system sound
 
@@ -205,7 +198,7 @@ If you previously used the shell-script setup:
 | No notifications at all | Run **"Test Notification"** from the command palette. Check the status bar isn't showing `Muted`. |
 | No sound | Check that `waiting.action` / `completed.action` aren't set to `Notification only` or `Nothing`, and that `volume` is > 0. |
 | Sound is too loud or too quiet | Adjust `volume`. `50` matches typical OS-notification loudness; `100` plays the file at its native level. OS master volume still applies. |
-| Notification doesn't open VS Code | macOS: run **"Configure macOS terminal-notifier"**. Windows: the toast click routes through a `vscode://dimokol.claude-notifications/…` URI to the extension's URI handler. On the first click VS Code asks "an external application wants to open"; choose **Open** and tick "Do not ask again for this extension". If clicks do nothing after that, check the **"Claude Notifications"** Output panel for `Click-to-focus [uri]` lines. |
+| Notification doesn't open the editor | macOS: run **"Configure macOS terminal-notifier"**, then check the Output panel for `macOS editor CLI:`. For an unusual install, set `claudeNotifications.macOS.codeCliPath`. Windows: the toast click routes through the editor's URI handler. On the first click it may ask to open the URI; choose **Open** and tick "Do not ask again for this extension". If clicks still do nothing, check the **"Claude Notifications"** Output panel for `Click-to-focus [uri]` lines. |
 | Want to fully uninstall | Just uninstall the extension from the VS Code Extensions view. The next Claude message after uninstall auto-cleans every artefact: hook entries from every Claude profile's `settings.json`, the per-workspace state in `~/.claude/focus-state/`, the wrapper dir at `~/.claude/claude-notifications/`, and (on Windows) the `claude-notif://` registry key plus the launcher in `%LOCALAPPDATA%\claude-notifications\`. The **"Claude Notifications: Uninstall"** palette command does the same thing eagerly if you want everything gone immediately. |
 | Duplicate notifications | Update to v3.2+. The new stage-ID dedup suppresses re-fires of the same event until you acknowledge. See [How It Works](#how-it-works). If still duplicating, make sure the legacy `dimokol.claude-terminal-focus` extension is uninstalled. |
 | Notifications stop firing | Inspect `~/.claude/focus-state/<hash>/sessions` (where `<hash>` is the 12-char hash for your workspace). If you see `resolved:true` stuck for the active session, that's the dedup remembering you acknowledged a stage. Delete the file to reset; the next event will create a fresh stage. |

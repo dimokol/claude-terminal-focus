@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.7.0] - 2026-07-22
+
+### Fixed
+- **macOS: banner clicks now open the editor they came from ([#5](https://github.com/dimokol/claude-notifications/issues/5)).** The hook always launched `code <workspace>`, so VSCodium, Cursor, Windsurf, VS Code Insiders, and other Code OSS users either got no response or opened VS Code Stable instead. The extension now resolves the running host's launcher from `vscode.env.appRoot`, `product.json`, and `vscode.env.uriScheme`, then records it per workspace for the out-of-process hook. Different editor products in different workspaces no longer overwrite one another through the shared `~/.claude` config, and an unusable recorded path never falls back to a different product's CLI. Click markers are also published atomically, closing the small poll-vs-write race that could focus a sibling session. Thanks [@jmuheim](https://github.com/jmuheim) for filing [#5](https://github.com/dimokol/claude-notifications/issues/5) with the precise root cause and host-aware CLI handoff suggestion.
+- **Notification settings cannot be read half-written.** Multiple editor windows can update `~/.claude/claude-notifications-config.json`; temp-file + rename prevents a hook from observing truncated JSON and briefly reverting to default notification behavior.
+
+### Added
+- **`claudeNotifications.macOS.codeCliPath` override.** Portable, renamed, and unusual macOS editor installs can point directly at their CLI launcher. Automatic host detection remains the default; absolute and `~`-prefixed paths are supported.
+
 ## [3.6.0] - 2026-07-07
 
 ### Fixed

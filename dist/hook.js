@@ -925,6 +925,171 @@ var require_terminal_names = __commonJS({
   }
 });
 
+// lib/mac-code-cli.js
+var require_mac_code_cli = __commonJS({
+  "lib/mac-code-cli.js"(exports2, module2) {
+    "use strict";
+    var fs2 = require("fs");
+    var os2 = require("os");
+    var path2 = require("path");
+    var { getStateDir: getStateDir2 } = require_state_paths();
+    var EDITOR_HOST_FILE = "editor-host";
+    var EDITOR_HOST_VERSION = 1;
+    var SCHEME_CLI_NAMES = {
+      vscode: ["code"],
+      "vscode-insiders": ["code-insiders"],
+      vscodium: ["codium"],
+      "vscodium-insiders": ["codium-insiders"],
+      "vscode-oss": ["codium", "code-oss"],
+      "code-oss": ["code-oss"],
+      cursor: ["cursor"],
+      windsurf: ["windsurf"]
+    };
+    function safeCliName2(value) {
+      if (typeof value !== "string") return "";
+      const name = value.trim();
+      if (!name || path2.basename(name) !== name) return "";
+      return /^[A-Za-z0-9._-]+$/.test(name) ? name : "";
+    }
+    function expandHome(value, homeDir = os2.homedir()) {
+      if (typeof value !== "string") return "";
+      const trimmed = value.trim();
+      if (trimmed === "~") return homeDir;
+      if (trimmed.startsWith("~/")) return path2.join(homeDir, trimmed.slice(2));
+      return trimmed;
+    }
+    function isExecutable2(filePath, fsLike = fs2) {
+      if (!filePath || !path2.isAbsolute(filePath)) return false;
+      try {
+        fsLike.accessSync(filePath, fs2.constants.X_OK);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+    function readApplicationName(appRoot, fsLike = fs2) {
+      if (!appRoot) return "";
+      try {
+        const product = JSON.parse(fsLike.readFileSync(path2.join(appRoot, "product.json"), "utf8"));
+        return safeCliName2(product && product.applicationName);
+      } catch (_) {
+        return "";
+      }
+    }
+    function appRootFromExecPath(execPath) {
+      if (typeof execPath !== "string" || !execPath) return "";
+      const normalized = execPath.replace(/\\/g, "/");
+      const marker = "/Contents/MacOS/";
+      const index = normalized.indexOf(marker);
+      if (index < 0) return "";
+      return path2.join(normalized.slice(0, index), "Contents", "Resources", "app");
+    }
+    function resolveMacCodeCli({
+      overridePath = "",
+      appRoot = "",
+      uriScheme = "",
+      execPath = "",
+      homeDir = os2.homedir(),
+      fsLike = fs2
+    } = {}) {
+      const override = expandHome(overridePath, homeDir);
+      if (isExecutable2(override, fsLike)) {
+        return {
+          codeCliPath: override,
+          cliName: path2.basename(override),
+          uriScheme: typeof uriScheme === "string" ? uriScheme : "",
+          source: "override"
+        };
+      }
+      const roots = [];
+      const addRoot = (root) => {
+        if (typeof root === "string" && root && !roots.includes(root)) roots.push(root);
+      };
+      addRoot(appRoot);
+      addRoot(appRootFromExecPath(execPath));
+      const names = [];
+      const addName = (name) => {
+        const safe = safeCliName2(name);
+        if (safe && !names.includes(safe)) names.push(safe);
+      };
+      for (const root of roots) addName(readApplicationName(root, fsLike));
+      const scheme = typeof uriScheme === "string" ? uriScheme.trim().toLowerCase() : "";
+      for (const name of SCHEME_CLI_NAMES[scheme] || []) addName(name);
+      addName(scheme);
+      for (const root of roots) {
+        for (const name of names) {
+          const candidate = path2.join(root, "bin", name);
+          if (isExecutable2(candidate, fsLike)) {
+            return {
+              codeCliPath: candidate,
+              cliName: name,
+              uriScheme: typeof uriScheme === "string" ? uriScheme : "",
+              source: "app-root"
+            };
+          }
+        }
+      }
+      return null;
+    }
+    function getEditorHostPath(workspaceRoot) {
+      return path2.join(getStateDir2(workspaceRoot), EDITOR_HOST_FILE);
+    }
+    function normalizeEditorHost2(value) {
+      if (!value || typeof value !== "object") return null;
+      const codeCliPath = typeof value.codeCliPath === "string" ? value.codeCliPath : "";
+      if (!path2.isAbsolute(codeCliPath)) return null;
+      return {
+        version: EDITOR_HOST_VERSION,
+        platform: "darwin",
+        codeCliPath,
+        cliName: safeCliName2(value.cliName) || path2.basename(codeCliPath),
+        uriScheme: typeof value.uriScheme === "string" ? value.uriScheme : "",
+        updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : 0
+      };
+    }
+    function writeEditorHost(workspaceRoot, host, fsLike = fs2) {
+      const normalized = normalizeEditorHost2({ ...host, updatedAt: Date.now() });
+      if (!normalized) return false;
+      const finalPath = getEditorHostPath(workspaceRoot);
+      const tmpPath = `${finalPath}.tmp.${process.pid}.${Date.now()}`;
+      try {
+        fsLike.mkdirSync(path2.dirname(finalPath), { recursive: true });
+        fsLike.writeFileSync(tmpPath, JSON.stringify(normalized, null, 2));
+        fsLike.renameSync(tmpPath, finalPath);
+        return true;
+      } catch (_) {
+        try {
+          fsLike.unlinkSync(tmpPath);
+        } catch (_2) {
+        }
+        return false;
+      }
+    }
+    function readEditorHost2(workspaceRoot, fsLike = fs2) {
+      try {
+        return normalizeEditorHost2(JSON.parse(fsLike.readFileSync(getEditorHostPath(workspaceRoot), "utf8")));
+      } catch (_) {
+        return null;
+      }
+    }
+    module2.exports = {
+      EDITOR_HOST_FILE,
+      EDITOR_HOST_VERSION,
+      SCHEME_CLI_NAMES,
+      safeCliName: safeCliName2,
+      expandHome,
+      isExecutable: isExecutable2,
+      readApplicationName,
+      appRootFromExecPath,
+      resolveMacCodeCli,
+      getEditorHostPath,
+      normalizeEditorHost: normalizeEditorHost2,
+      writeEditorHost,
+      readEditorHost: readEditorHost2
+    };
+  }
+});
+
 // hook.js
 var fs = require("fs");
 var path = require("path");
@@ -946,6 +1111,7 @@ var { snapshot: processSnapshot, walkUp } = require_process_tree();
 var { schemeForBinaryName, classifyBuild } = require_code_build();
 var { classifyHookInput, extractQuestionText } = require_hook_input();
 var { readTerminalNamesCache, lookupCustomName } = require_terminal_names();
+var { isExecutable, normalizeEditorHost, readEditorHost, safeCliName } = require_mac_code_cli();
 var SHELL_PROCESS_NAMES = /* @__PURE__ */ new Set([
   "bash.exe",
   "sh.exe",
@@ -1268,19 +1434,18 @@ try {} finally { Remove-Item -LiteralPath '${tmpSoundScript.replace(/'/g, "''")}
     }
   }
   if (!shouldNotify) process.exit(0);
-  function findCodeCli() {
-    const candidates = ["/usr/local/bin/code", "/opt/homebrew/bin/code"];
-    for (const c of candidates) {
-      if (fs.existsSync(c)) return c;
+  function findCodeCli(host) {
+    if (host) {
+      if (isExecutable(host.codeCliPath)) return host.codeCliPath;
+      const cliName = safeCliName(host.cliName);
+      if (cliName) return findMacBinary(cliName);
+      return null;
     }
-    try {
-      return execSync("which code", { encoding: "utf8", timeout: 2e3 }).trim();
-    } catch (_) {
-      return "code";
-    }
+    return findMacBinary("code") || "code";
   }
   if (process.platform === "darwin") {
-    const codeCli = findCodeCli();
+    const macHost = readEditorHost(workspaceRoot) || normalizeEditorHost(config.macOS);
+    const codeCli = findCodeCli(macHost);
     const tnBinary = findMacBinary("terminal-notifier");
     if (tnBinary) {
       try {
@@ -1294,7 +1459,9 @@ try {} finally { Remove-Item -LiteralPath '${tmpSoundScript.replace(/'/g, "''")}
           project: projectName,
           aiTitle
         });
-        const executeCmd = `/usr/bin/printf '%s' ${shEsc(clickPayload)} > ${shEsc(clickedPath)} && ${shEsc(codeCli)} ${shEsc(workspaceRoot)}`;
+        const clickedTmpPath = `${clickedPath}.tmp.${process.pid}.${Date.now()}`;
+        const writeClickMarker = `/usr/bin/printf '%s' ${shEsc(clickPayload)} > ${shEsc(clickedTmpPath)} && /bin/mv -f ${shEsc(clickedTmpPath)} ${shEsc(clickedPath)}`;
+        const executeCmd = codeCli ? `${writeClickMarker} && ${shEsc(codeCli)} ${shEsc(workspaceRoot)}` : writeClickMarker;
         const notifierArgs = [
           "-title",
           eventInfo.title,
