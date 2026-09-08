@@ -40,13 +40,13 @@ test('SELF_IDENTIFIERS includes both wrapper paths AND legacy extension dir', ()
 test('discoverProfiles finds .claude and .claude-* with settings.json, skips backups', () => {
   const home = mkTempHome();
   writeJson(path.join(home, '.claude/settings.json'), {});
-  writeJson(path.join(home, '.claude-dimo/settings.json'), {});
+  writeJson(path.join(home, '.claude-acct-a/settings.json'), {});
   writeJson(path.join(home, '.claude-backup-2024/settings.json'), {});
   fs.mkdirSync(path.join(home, '.claude-no-settings'), { recursive: true });
 
   const profiles = discoverProfiles(home).sort();
   assert.deepEqual(profiles, [
-    path.join(home, '.claude-dimo/settings.json'),
+    path.join(home, '.claude-acct-a/settings.json'),
     path.join(home, '.claude/settings.json')
   ].sort());
 });
@@ -132,7 +132,7 @@ test('selfDestruct cleans every profile + focus-state + wrapper dir', () => {
       UserPromptSubmit: [ENTRY(WRAPPER_UP_CMD)]
     }
   });
-  writeJson(path.join(home, '.claude-dimo/settings.json'), {
+  writeJson(path.join(home, '.claude-acct-a/settings.json'), {
     hooks: {
       Stop: [ENTRY(LEGACY_CMD)]
     }
@@ -150,8 +150,8 @@ test('selfDestruct cleans every profile + focus-state + wrapper dir', () => {
   assert.equal(def.hooks.UserPromptSubmit, undefined);
 
   // Second profile: legacy entry gone, hooks key dropped (was only ours).
-  const dimo = readJson(path.join(home, '.claude-dimo/settings.json'));
-  assert.equal(dimo.hooks, undefined);
+  const acctA = readJson(path.join(home, '.claude-acct-a/settings.json'));
+  assert.equal(acctA.hooks, undefined);
 
   // Focus-state gone.
   assert.equal(pathExistsSync(path.join(home, '.claude/focus-state')), false);

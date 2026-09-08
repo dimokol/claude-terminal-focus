@@ -24,12 +24,12 @@ test('discoverProfiles finds default ~/.claude/settings.json', () => {
 test('discoverProfiles finds ~/.claude-<name>/settings.json profiles', () => {
   const home = makeTempHome();
   touch(path.join(home, '.claude/settings.json'));
-  touch(path.join(home, '.claude-andreas/settings.json'));
-  touch(path.join(home, '.claude-dimo/settings.json'));
+  touch(path.join(home, '.claude-acct-b/settings.json'));
+  touch(path.join(home, '.claude-acct-a/settings.json'));
   const profiles = discoverProfiles(home).sort();
   assert.deepStrictEqual(profiles, [
-    path.join(home, '.claude-andreas/settings.json'),
-    path.join(home, '.claude-dimo/settings.json'),
+    path.join(home, '.claude-acct-a/settings.json'),
+    path.join(home, '.claude-acct-b/settings.json'),
     path.join(home, '.claude/settings.json')
   ]);
 });
@@ -133,7 +133,7 @@ test('checkAllProfiles returns one entry per discovered profile', () => {
 test('checkAllProfiles flags profile missing UserPromptSubmit as partial', () => {
   const home = makeTempHome();
   writeSettings(
-    path.join(home, '.claude-andreas/settings.json'),
+    path.join(home, '.claude-acct-b/settings.json'),
     buildLegacySettings(LEGACY_3_4, { includeUserPrompt: false })
   );
 
@@ -332,8 +332,8 @@ test('installHooks output round-trips to installed (async-aware checkHookStatus)
   const settingsPath = path.join(home, '.claude/settings.json');
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   const wrapper = {
-    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
-    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+    hookPath:           '/Users/acctA/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/acctA/.claude/claude-notifications/hook-user-prompt.cjs'
   };
   installHooks(wrapper, { settingsPath });
   const status = checkHookStatus(wrapper.hookPath, settingsPath);
@@ -350,8 +350,8 @@ test('installHooks marks the notification hooks async (fire-and-forget)', () => 
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
 
   const wrapper = {
-    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
-    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+    hookPath:           '/Users/acctA/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/acctA/.claude/claude-notifications/hook-user-prompt.cjs'
   };
   const r = installHooks(wrapper, { settingsPath });
   assert.strictEqual(r.success, true, r.message);
@@ -372,8 +372,8 @@ test('installHooks does NOT mark UserPromptSubmit async', () => {
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
 
   const wrapper = {
-    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
-    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+    hookPath:           '/Users/acctA/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/acctA/.claude/claude-notifications/hook-user-prompt.cjs'
   };
   installHooks(wrapper, { settingsPath });
 
@@ -388,8 +388,8 @@ test('installHooks is idempotent on POSIX paths (no duplicate accumulation)', ()
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
 
   const posixWrapper = {
-    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
-    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+    hookPath:           '/Users/acctA/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/acctA/.claude/claude-notifications/hook-user-prompt.cjs'
   };
 
   for (let i = 0; i < 5; i++) {
@@ -411,8 +411,8 @@ test('installHooks writes a PreToolUse entry scoped to AskUserQuestion only', ()
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
 
   const wrapper = {
-    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
-    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+    hookPath:           '/Users/acctA/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/acctA/.claude/claude-notifications/hook-user-prompt.cjs'
   };
   const r = installHooks(wrapper, { settingsPath });
   assert.strictEqual(r.success, true, r.message);
@@ -432,12 +432,12 @@ test('installHooks preserves foreign PreToolUse entries (user\'s own hooks)', ()
   const home = makeTempHome();
   const settingsPath = path.join(home, '.claude/settings.json');
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  const foreign = { matcher: 'Bash', hooks: [{ type: 'command', command: 'sh "/Users/dimo/.claude-shared/hooks/no-auto-merge.sh"' }] };
+  const foreign = { matcher: 'Bash', hooks: [{ type: 'command', command: 'sh "/Users/acctA/.claude-shared/hooks/no-auto-merge.sh"' }] };
   fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { PreToolUse: [foreign] } }, null, 2));
 
   const wrapper = {
-    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
-    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+    hookPath:           '/Users/acctA/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/acctA/.claude/claude-notifications/hook-user-prompt.cjs'
   };
   installHooks(wrapper, { settingsPath });
   installHooks(wrapper, { settingsPath }); // idempotency with a foreign entry present
@@ -466,12 +466,12 @@ test('uninstallHooks removes our PreToolUse entry but keeps foreign ones', () =>
   const home = makeTempHome();
   const settingsPath = path.join(home, '.claude/settings.json');
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  const foreign = { matcher: 'Bash', hooks: [{ type: 'command', command: 'sh "/Users/dimo/hooks/guard.sh"' }] };
+  const foreign = { matcher: 'Bash', hooks: [{ type: 'command', command: 'sh "/Users/acctA/hooks/guard.sh"' }] };
   fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { PreToolUse: [foreign] } }, null, 2));
 
   const wrapper = {
-    hookPath:           '/Users/dimo/.claude/claude-notifications/hook.cjs',
-    userPromptHookPath: '/Users/dimo/.claude/claude-notifications/hook-user-prompt.cjs'
+    hookPath:           '/Users/acctA/.claude/claude-notifications/hook.cjs',
+    userPromptHookPath: '/Users/acctA/.claude/claude-notifications/hook-user-prompt.cjs'
   };
   installHooks(wrapper, { settingsPath });
 

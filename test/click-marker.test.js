@@ -21,13 +21,13 @@ test('parseClickMarker returns parsed payload for a valid marker', () => {
     sessionId: 'abc12345',
     pids: [1234, 5678, 9012],
     event: 'waiting',
-    project: 'ridebly'
+    project: 'demo-app'
   });
   const parsed = parseClickMarker(payload);
   assert.strictEqual(parsed.sessionId, 'abc12345');
   assert.deepStrictEqual(parsed.pids, [1234, 5678, 9012]);
   assert.strictEqual(parsed.event, 'waiting');
-  assert.strictEqual(parsed.project, 'ridebly');
+  assert.strictEqual(parsed.project, 'demo-app');
   assert.ok(typeof parsed.timestamp === 'number');
 });
 
